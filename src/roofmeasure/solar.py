@@ -99,14 +99,25 @@ def fetch_geotiff(url: str) -> tuple[np.ndarray, float, float]:
         page = tf.pages[0]
         arr = page.asarray()
         tags = page.tags
-        scale = tags.get(33550)  # ModelPixelScaleTag
-        tie = tags.get(33922)    # ModelTiepointTag
-        if scale is None or tie is None:
+        sx = sy = None
+        lat0 = None
+        xform = tags.get(34264)   # ModelTransformationTag (projected, meters)
+        scale = tags.get(33550)   # ModelPixelScaleTag
+        tie = tags.get(33922)     # ModelTiepointTag
+        if xform is not None:
+            t = xform.value
+            sx, sy = abs(float(t[0])), abs(float(t[5]))
+            if abs(float(t[3])) <= 360.0:  # geographic transform (degrees)
+                lat0 = float(t[7])
+        elif scale is not None:
+            sx, sy = abs(float(scale.value[0])), abs(float(scale.value[1]))
+            if sx < 0.01:  # degrees, not meters
+                lat0 = float(tie.value[4]) if tie is not None else 0.0
+        if sx is None:
             raise SolarAPIError("GeoTIFF missing georeferencing tags")
-        sx_deg, sy_deg = float(scale.value[0]), float(scale.value[1])
-        lat0 = float(tie.value[4])  # tiepoint Y (latitude)
-    lat_m_per_deg = 111_320.0
-    lng_m_per_deg = 111_320.0 * float(np.cos(np.radians(lat0)))
+        if lat0 is not None:  # convert degrees -> meters
+            sy *= 111_320.0
+            sx *= 111_320.0 * float(np.cos(np.radians(lat0)))
     if arr.ndim == 3:
         arr = arr[..., 0] if arr.shape[-1] < arr.shape[0] else arr[0]
-    return arr.astype(np.float32), sx_deg * lng_m_per_deg, sy_deg * lat_m_per_deg
+    return arr.astype(np.float32), sx, sy
