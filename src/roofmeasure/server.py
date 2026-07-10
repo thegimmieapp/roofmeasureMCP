@@ -61,8 +61,10 @@ def measure_roof(address: str) -> str:
 @mcp.tool()
 def generate_roof_report(address: str, company: str = "Stronghouse Solutions",
                          contact: str = "", phone: str = "") -> str:
-    """Generate an EagleView-style roof measurement report (Markdown file) for
-    an address. Returns JSON with the saved file path and a summary.
+    """Generate an EagleView-style roof measurement report for an address:
+    a PDF with the aerial image and labeled Length/Pitch/Area diagrams plus
+    summary tables, and a Markdown version. Returns JSON with file paths and
+    a summary.
 
     Args:
         address: Full property address.
@@ -70,12 +72,20 @@ def generate_roof_report(address: str, company: str = "Stronghouse Solutions",
         contact: Contact person shown on the report (optional).
         phone: Contact phone shown on the report (optional).
     """
-    m = pipeline.measure_address(address)
+    m, detail, rgb = pipeline.measure_address_full(address)
     md = report.render_markdown(m, company=company, contact=contact, phone=phone)
     out = os.path.join(_out_dir(), f"Roof_Report_{_slug(address)}.md")
     with open(out, "w") as f:
         f.write(md)
+    pdf_path = ""
+    if detail is not None:
+        from .diagrams import render_pdf_report
+
+        pdf_path = os.path.join(_out_dir(), f"Roof_Report_{_slug(address)}.pdf")
+        render_pdf_report(m, detail, pdf_path, rgb=rgb, company=company,
+                          contact=contact, phone=phone)
     return json.dumps({
+        "report_pdf": pdf_path or "unavailable (segment-statistics fallback; no raster geometry)",
         "report_file": out,
         "summary": {
             "total_area_sqft": m.total_area_sqft,
@@ -156,10 +166,11 @@ def generate_xactimate_estimate(
                         "and roof component counts (pipe jacks, vents, skylights, chimneys)."),
         })
 
+    detail = rgb = None
     if measurements_json:
         m = _measurements_from_json(measurements_json, address)
     else:
-        m = pipeline.measure_address(address)
+        m, detail, rgb = pipeline.measure_address_full(address)
 
     components = json.loads(components_json or "{}")
     rules = pricing.PricingRules()
@@ -175,6 +186,17 @@ def generate_xactimate_estimate(
     today = date.today().strftime("%-m/%-d/%Y") if os.name != "nt" else date.today().strftime("%m/%d/%Y")
     prop_lines = [p.strip() for p in m.address.split(",")][:3]
     est_name = _slug(prop_lines[0] if prop_lines else address).upper()[:24]
+
+    diagram_image_path = ""
+    if detail is not None:
+        try:
+            from .diagrams import render_diagram_png
+
+            diagram_image_path = os.path.join(_out_dir(), f"_diagram_{_slug(address)}.png")
+            render_diagram_png(m, detail, diagram_image_path, rgb=rgb)
+        except Exception as exc:
+            diagram_image_path = ""
+            m.notes.append(f"Roof diagram image unavailable ({type(exc).__name__}: {exc}).")
 
     cfg = xactimate.EstimateConfig(
         out_file=os.path.join(_out_dir(), f"{company_name.replace(' ', '_')}_Estimate_{_slug(address)}.docx"),
@@ -197,6 +219,8 @@ def generate_xactimate_estimate(
         price_list=price_list,
         estimate_name=est_name,
         footer_date=today,
+        diagram_image_path=diagram_image_path,
+        imagery_date=m.imagery_date,
         tax_rate=tax_rate,
         include_op=include_op,
         structures=[{

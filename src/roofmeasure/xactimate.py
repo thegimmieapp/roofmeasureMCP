@@ -49,6 +49,10 @@ class EstimateConfig:
     price_list: str = ""
     estimate_name: str = ""
     footer_date: str = ""
+    # roof diagram / aerial (optional; from roofmeasure.diagrams)
+    diagram_image_path: str = ""
+    aerial_image_path: str = ""
+    imagery_date: str = ""
     tax_rate: float = 0.0825
     include_op: bool = False       # Stronghouse default: no O&P unless requested
     op_overhead_pct: float = 0.10
@@ -232,6 +236,30 @@ def build_estimate(cfg: EstimateConfig) -> dict:
     _tight(p)
     _run(p, "Estimate: ", 10, True)
     _run(p, cfg.estimate_name, 10)
+
+    # ---- roof diagram / aerial (optional) ----
+    if (cfg.aerial_image_path and os.path.exists(cfg.aerial_image_path)) or \
+       (cfg.diagram_image_path and os.path.exists(cfg.diagram_image_path)):
+        doc.add_page_break()
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(10)
+        _run(p, "Roof Diagram", 12, True)
+        if cfg.imagery_date:
+            p2 = doc.add_paragraph()
+            _tight(p2)
+            _run(p2, f"Satellite imagery date: {cfg.imagery_date}", 9, italic=True)
+        # prefer the composite (aerial + diagram) image if present; fall back
+        # to whichever single image is available
+        img_path = cfg.diagram_image_path if (cfg.diagram_image_path and os.path.exists(cfg.diagram_image_path)) \
+            else cfg.aerial_image_path
+        ip = doc.add_paragraph()
+        ip.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = ip.add_run()
+        run.add_picture(img_path, width=Inches(6.5))
+        cap = doc.add_paragraph()
+        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _run(cap, "Facet-level diagram derived from satellite elevation data. "
+                  "Field verify edge lengths before material order.", 8, italic=True)
 
     # ---- structures ----
     built = []

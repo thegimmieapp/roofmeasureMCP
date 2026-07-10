@@ -29,13 +29,19 @@ def report(
     out: str = typer.Option("", "-o", "--out", help="Output .md path"),
     company: str = typer.Option("Stronghouse Solutions", help="Company name on the report"),
 ):
-    """Generate an EagleView-style Markdown measurement report."""
-    m = pipeline.measure_address(address)
+    """Generate an EagleView-style report (PDF with labeled diagrams + Markdown)."""
+    m, detail, rgb = pipeline.measure_address_full(address)
     md = report_mod.render_markdown(m, company=company)
     if not out:
         out = f"Roof_Report_{address.split(',')[0].replace(' ', '_')}.md"
     with open(out, "w") as f:
         f.write(md)
+    if detail is not None:
+        from .diagrams import render_pdf_report
+
+        pdf = out.rsplit(".", 1)[0] + ".pdf"
+        render_pdf_report(m, detail, pdf, rgb=rgb, company=company)
+        typer.echo(f"Saved {pdf}")
     typer.echo(f"Saved {out}")
     typer.echo(f"Total: {m.total_area_sqft:,.0f} sq ft ({m.squares:.2f} SQ), "
                f"{m.facet_count} facets, predominant pitch {m.predominant_pitch} [{m.method}]")
