@@ -121,3 +121,21 @@ def fetch_geotiff(url: str) -> tuple[np.ndarray, float, float]:
     if arr.ndim == 3:
         arr = arr[..., 0] if arr.shape[-1] < arr.shape[0] else arr[0]
     return arr.astype(np.float32), sx, sy
+
+
+def fetch_geotiff_rgb(url: str) -> np.ndarray | None:
+    """Download a Solar API RGB GeoTIFF as an HxWx3 uint8 array (or None)."""
+    import tifffile
+
+    try:
+        r = requests.get(url, params={"key": _key()}, timeout=120)
+        r.raise_for_status()
+        with tifffile.TiffFile(io.BytesIO(r.content)) as tf:
+            arr = tf.pages[0].asarray()
+        if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[0] < arr.shape[-1]:
+            arr = np.moveaxis(arr, 0, -1)
+        if arr.ndim != 3:
+            return None
+        return arr[..., :3].astype(np.uint8)
+    except Exception:
+        return None

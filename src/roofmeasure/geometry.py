@@ -21,10 +21,32 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from .model import EdgeSummary, Facet, RoofMeasurements, slope_deg_to_pitch
+
+
+@dataclass
+class EdgeSegment:
+    """One classified edge segment, with pixel geometry for diagram rendering."""
+    kind: str                  # ridge | hip | valley | eave | rake
+    length_ft: float
+    pixels: list               # [(y, x), ...]
+    mid_yx: tuple              # label anchor
+
+
+@dataclass
+class MeasureDetail:
+    """Raster-space geometry for diagram rendering."""
+    labels: np.ndarray         # facet label raster (0 = background)
+    px_x: float
+    px_y: float
+    edges: list = field(default_factory=list)        # [EdgeSegment]
+    facet_centroids: dict = field(default_factory=dict)  # facet letter -> (y, x)
+    facet_ids: dict = field(default_factory=dict)         # facet letter -> raster id
+    facet_azimuths: dict = field(default_factory=dict)    # facet letter -> azimuth deg
 
 M_TO_FT = 3.280839895
 SQM_TO_SQFT = 10.76391041671
@@ -409,8 +431,13 @@ def measure_from_dsm(
     address: str,
     lat: float,
     lng: float,
-) -> RoofMeasurements:
-    """Full facet + edge extraction from a DSM and roof mask."""
+    return_detail: bool = False,
+):
+    """Full facet + edge extraction from a DSM and roof mask.
+
+    Returns RoofMeasurements, or (RoofMeasurements, MeasureDetail) when
+    return_detail is True.
+    """
     mask = mask.astype(bool)
     z = _smooth(dsm, mask)
     slope, aspect = _slope_aspect(z, px_x, px_y)
@@ -474,7 +501,14 @@ def measure_from_dsm(
                 perimeter[l1].append((y, x))
 
     edges = EdgeSummary()
+    edge_segments: list[EdgeSegment] = []
     facet_mean_z = {i: s["mean_z"] for i, s in facet_stats.items()}
+
+    def _record(kind: str, cluster: list, length_ft: float):
+        cy = sum(p[0] for p in cluster) / len(cluster)
+        cx = sum(p[1] for p in cluster) / len(cluster)
+        edge_segments.append(EdgeSegment(kind=kind, length_ft=round(length_ft, 1),
+                                         pixels=cluster, mid_yx=(cy, cx)))
 
     # ---- classify internal boundaries: ridge / hip / valley ----
     for (i, j), pix in internal.items():
@@ -490,19 +524,18 @@ def measure_from_dsm(
             if not higher:
                 edges.valleys_ft += length_ft
                 edges.valley_count += 1
+                _record("valley", cluster, length_ft)
             else:
                 # ridge: near-level boundary between opposing slopes
                 level = dz < max(0.6, 0.05 * plan_m)
-                if level and aspect_gap > 120.0:
+                if level:
                     edges.ridges_ft += length_ft
                     edges.ridge_count += 1
-                elif level and aspect_gap <= 120.0:
-                    # level high boundary between similar-facing facets: treat as ridge
-                    edges.ridges_ft += length_ft
-                    edges.ridge_count += 1
+                    _record("ridge", cluster, length_ft)
                 else:
                     edges.hips_ft += length_ft
                     edges.hip_count += 1
+                    _record("hip", cluster, length_ft)
 
     # ---- classify perimeter boundaries: eave / rake ----
     # Perimeter pixel runs can turn corners (eave meeting rake), so classify
@@ -535,14 +568,18 @@ def measure_from_dsm(
             plan_m, _, _ = _pca_segment(cluster, z, px_x, px_y)
             if plan_m * M_TO_FT < MIN_EDGE_LEN_FT:
                 continue
-            edges.eaves_ft += plan_m * M_TO_FT  # eaves are level: plan length
+            length_ft = plan_m * M_TO_FT  # eaves are level: plan length
+            edges.eaves_ft += length_ft
             edges.eave_count += 1
+            _record("eave", cluster, length_ft)
         for cluster in _cluster_pixels(rake_pix):
             plan_m, _, dz = _pca_segment(cluster, z, px_x, px_y)
             if plan_m * M_TO_FT < MIN_EDGE_LEN_FT:
                 continue
-            edges.rakes_ft += _slope_corrected(plan_m, dz) * M_TO_FT
+            length_ft = _slope_corrected(plan_m, dz) * M_TO_FT
+            edges.rakes_ft += length_ft
             edges.rake_count += 1
+            _record("rake", cluster, length_ft)
 
     # ---- assemble measurements ----
     order = sorted(ids, key=lambda i: facet_stats[i]["surf_m2"])
@@ -572,7 +609,15 @@ def measure_from_dsm(
     for k in ("ridges_ft", "hips_ft", "valleys_ft", "rakes_ft", "eaves_ft"):
         setattr(edges, k, round(getattr(edges, k)))
 
-    return RoofMeasurements(
+    detail = MeasureDetail(labels=labels, px_x=px_x, px_y=px_y, edges=edge_segments)
+    for rank, i in enumerate(order):
+        letter = _facet_label(rank)
+        ys2, xs2 = np.where(labels == i)
+        detail.facet_centroids[letter] = (float(ys2.mean()), float(xs2.mean()))
+        detail.facet_ids[letter] = i
+        detail.facet_azimuths[letter] = facet_stats[i]["aspect"]
+
+    result = RoofMeasurements(
         address=address,
         latitude=lat,
         longitude=lng,
@@ -583,6 +628,9 @@ def measure_from_dsm(
         areas_per_pitch={k: round(v, 1) for k, v in sorted(areas_per_pitch.items(), key=lambda kv: int(kv[0].split("/")[0]))},
         method="dsm",
     )
+    if return_detail:
+        return result, detail
+    return result
 
 
 def _facet_label(rank: int) -> str:
