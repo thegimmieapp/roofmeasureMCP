@@ -1,11 +1,15 @@
-"""EagleView-style PDF measurement report with labeled diagrams.
+"""EagleView-style PDF measurement report with vector (straight-line) diagrams.
+
+Roofs are combinations of straight-edged shapes; all diagrams here are drawn
+from vectorized facet polygons (see vectorize.py), never raster pixels.
 
 Pages:
   1. Cover: summary table + aerial image
-  2. Length Diagram: color-coded ridges/hips/valleys/rakes/eaves with labels
+  2. Length Diagram: color-coded ridges/hips/valleys/rakes/eaves, labeled
   3. Pitch Diagram: facets shaded, pitch labels + slope-direction arrows
   4. Area Diagram: facet letters + areas
   5. Tables: areas per pitch, waste calculation, facet detail
+  6. Notes & disclaimer
 """
 
 from __future__ import annotations
@@ -20,9 +24,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Polygon as MplPolygon  # noqa: E402
 
 from .geometry import MeasureDetail  # noqa: E402
 from .model import RoofMeasurements  # noqa: E402
+from .vectorize import (classify_outline_edges, classify_polygon_edges,  # noqa: E402
+                        facet_polygons, internal_lines, outline_polygon)
 
 EDGE_COLORS = {
     "ridge": "#d62728",   # red
@@ -31,56 +38,86 @@ EDGE_COLORS = {
     "eave": "#2ca02c",    # green
     "rake": "#9467bd",    # purple
 }
+UNMATCHED_COLOR = "#777777"
 MIN_LABEL_FT = 5.0
 
 
-def _roof_bbox(labels: np.ndarray, pad: int = 12) -> tuple[int, int, int, int]:
-    ys, xs = np.where(labels > 0)
-    h, w = labels.shape
-    return (max(ys.min() - pad, 0), min(ys.max() + pad, h - 1),
-            max(xs.min() - pad, 0), min(xs.max() + pad, w - 1))
+class _Vec:
+    """Vector geometry bundle computed once per report."""
+
+    def __init__(self, m: RoofMeasurements, detail: MeasureDetail):
+        self.outline = outline_polygon(detail)          # Nx2 (y, x), closed
+        self.outline_edges = classify_outline_edges(self.outline, detail)
+        self.internal = internal_lines(detail)          # straight ridge/hip/valley lines
+        self.edges = self.outline_edges + self.internal
+        pts = self.outline if len(self.outline) else np.zeros((1, 2))
+        pad = 14
+        self.bbox = (pts[:, 0].min() - pad, pts[:, 0].max() + pad,
+                     pts[:, 1].min() - pad, pts[:, 1].max() + pad)
+        self.centroids = dict(detail.facet_centroids)
 
 
 def _setup_ax(ax, bbox):
     y0, y1, x0, x1 = bbox
     ax.set_xlim(x0, x1)
-    ax.set_ylim(y1, y0)  # invert y for raster orientation (north up)
+    ax.set_ylim(y1, y0)  # raster orientation, north up
     ax.set_aspect("equal")
     ax.axis("off")
 
 
-def _draw_facet_outline(ax, labels, bbox, lw: float = 0.6):
-    """Light outline of all facet boundaries."""
-    b = np.zeros(labels.shape, dtype=bool)
-    lab = labels
-    b[:-1, :] |= (lab[:-1, :] != lab[1:, :])
-    b[:, :-1] |= (lab[:, :-1] != lab[:, 1:])
-    b &= labels > 0
-    ys, xs = np.where(b)
-    ax.scatter(xs, ys, s=lw, c="#555555", marker="s", linewidths=0)
+def _draw_roof(ax, vec: _Vec, fill: str = "#f2f4f7",
+               outline: str = "#444444", lw: float = 1.2):
+    """Roof outline (filled) + straight internal lines: the base drawing."""
+    if len(vec.outline):
+        ax.add_patch(MplPolygon(vec.outline[:, ::-1], closed=True, facecolor=fill,
+                                edgecolor=outline, linewidth=lw, zorder=1))
+    for e in vec.internal:
+        (y0, x0), (y1, x1) = e["p0"], e["p1"]
+        ax.plot([x0, x1], [y0, y1], color="#666666", lw=0.9, zorder=2)
 
 
-def _draw_edges(ax, detail: MeasureDetail, label_lengths: bool = True):
-    for seg in detail.edges:
-        pix = np.asarray(seg.pixels)
-        ax.scatter(pix[:, 1], pix[:, 0], s=1.6, c=EDGE_COLORS[seg.kind],
-                   marker="s", linewidths=0, zorder=3)
-        if label_lengths and seg.length_ft >= MIN_LABEL_FT:
-            cy, cx = seg.mid_yx
-            ax.annotate(f"{seg.length_ft:.0f}'", xy=(cx, cy), fontsize=6.5,
-                        fontweight="bold", color="black", ha="center", va="center",
-                        zorder=5,
-                        bbox=dict(boxstyle="round,pad=0.15", fc="white",
-                                  ec=EDGE_COLORS[seg.kind], lw=0.7, alpha=0.9))
+def _draw_classified_edges(ax, vec: _Vec, label_lengths: bool = True, lw: float = 2.4):
+    drawn_labels: list[tuple[float, float]] = []
+    for e in vec.edges:
+        color = EDGE_COLORS.get(e["kind"], UNMATCHED_COLOR)
+        (y0, x0), (y1, x1) = e["p0"], e["p1"]
+        ax.plot([x0, x1], [y0, y1], color=color,
+                lw=lw if e["kind"] else 1.0, solid_capstyle="round", zorder=3)
+        if not label_lengths or not e["kind"] or e["length_ft"] < MIN_LABEL_FT:
+            continue
+        mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        # avoid stacking labels on top of each other
+        if any(math.hypot(mx - ax_, my - ay_) < 12 for ax_, ay_ in drawn_labels):
+            continue
+        drawn_labels.append((mx, my))
+        ang = math.degrees(math.atan2(-(y1 - y0), x1 - x0))
+        if ang > 90:
+            ang -= 180
+        elif ang < -90:
+            ang += 180
+        ax.annotate(f"{e['length_ft']:.0f}'", xy=(mx, my), fontsize=6.5,
+                    fontweight="bold", color="black", ha="center", va="center",
+                    rotation=ang, rotation_mode="anchor", zorder=5,
+                    bbox=dict(boxstyle="round,pad=0.13", fc="white",
+                              ec=EDGE_COLORS[e["kind"]], lw=0.7, alpha=0.92))
 
 
-def _facet_fill(ax, labels, detail, colors_by_letter: dict):
-    img = np.ones((*labels.shape, 4))
-    img[..., 3] = 0.0
-    for letter, fid in detail.facet_ids.items():
-        c = colors_by_letter.get(letter, (0.8, 0.8, 0.8, 1.0))
-        img[labels == fid] = c
-    ax.imshow(img, interpolation="nearest", zorder=1)
+def _legend(ax, m: RoofMeasurements, totals: bool = True, ncol: int = 3):
+    e = m.edges
+    if totals:
+        labels = {
+            "ridge": f"Ridges = {e.ridges_ft:,.0f} ft",
+            "hip": f"Hips = {e.hips_ft:,.0f} ft",
+            "valley": f"Valleys = {e.valleys_ft:,.0f} ft",
+            "eave": f"Eaves = {e.eaves_ft:,.0f} ft",
+            "rake": f"Rakes = {e.rakes_ft:,.0f} ft",
+        }
+    else:
+        labels = {k: k.capitalize() for k in EDGE_COLORS}
+    handles = [Line2D([0], [0], color=c, lw=3, label=labels[k])
+               for k, c in EDGE_COLORS.items()]
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.02),
+              ncol=ncol, fontsize=9 if totals else 7, frameon=False)
 
 
 def _table(ax, col_labels, rows, title=None, fontsize=8, col_widths=None):
@@ -99,22 +136,25 @@ def _table(ax, col_labels, rows, title=None, fontsize=8, col_widths=None):
             cell.set_text_props(fontweight="bold")
 
 
+def _pitch_colors(m: RoofMeasurements, vec: _Vec) -> tuple[dict, dict]:
+    facet_by_letter = {f.label: f for f in m.facets}
+    return facet_by_letter, {}
+
+
 def render_diagram_png(
     m: RoofMeasurements,
     detail: MeasureDetail,
     out_path: str,
     rgb: np.ndarray | None = None,
 ) -> str:
-    """Single composite PNG (aerial + pitch-shaded facet diagram) for
-    embedding directly into the Xactimate .docx as a 'Roof Diagram' page."""
-    labels = detail.labels
-    bbox = _roof_bbox(labels)
+    """Composite PNG (aerial + straight-line roof diagram) for the Xactimate docx."""
+    vec = _Vec(m, detail)
     fig = plt.figure(figsize=(8.5, 5.2), dpi=200)
 
     if rgb is not None:
-        y0, y1, x0, x1 = bbox
+        y0, y1, x0, x1 = [int(v) for v in vec.bbox]
         ax0 = fig.add_axes([0.03, 0.08, 0.42, 0.84])
-        ax0.imshow(rgb[y0:y1, x0:x1])
+        ax0.imshow(rgb[max(y0, 0):y1, max(x0, 0):x1])
         ax0.axis("off")
         ax0.set_title("Aerial", fontsize=10, fontweight="bold", loc="left")
         diag_rect = [0.49, 0.08, 0.48, 0.84]
@@ -122,28 +162,19 @@ def render_diagram_png(
         diag_rect = [0.05, 0.08, 0.90, 0.84]
 
     ax = fig.add_axes(diag_rect)
-    _setup_ax(ax, bbox)
-    facet_by_letter = {f.label: f for f in m.facets}
-    pitches = sorted({f.pitch for f in m.facets}, key=lambda p: int(p.split("/")[0]))
-    cmap = plt.cm.Blues(np.linspace(0.25, 0.85, max(len(pitches), 1)))
-    pitch_color = {p: cmap[i] for i, p in enumerate(pitches)}
-    colors_by_letter = {l: pitch_color[facet_by_letter[l].pitch]
-                        for l in detail.facet_ids if l in facet_by_letter}
-    _facet_fill(ax, labels, detail, colors_by_letter)
-    _draw_facet_outline(ax, labels, bbox)
-    _draw_edges(ax, detail, label_lengths=False)
-    for letter, (cy, cx) in detail.facet_centroids.items():
+    _setup_ax(ax, vec.bbox)
+    facet_by_letter, _ = _pitch_colors(m, vec)
+    _draw_roof(ax, vec)
+    _draw_classified_edges(ax, vec, label_lengths=False)
+    for letter, (cy, cx) in vec.centroids.items():
         f = facet_by_letter.get(letter)
         if f is None or f.surface_area_sqft < 20:
             continue
         ax.text(cx, cy, letter, fontsize=8, fontweight="bold", ha="center", va="center",
-                zorder=5, bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="black", lw=0.6, alpha=0.9))
+                zorder=5, bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="black",
+                                    lw=0.6, alpha=0.9))
     ax.set_title("Roof Diagram", fontsize=10, fontweight="bold", loc="left")
-    handles = [Line2D([0], [0], color=c, lw=2.5, label=k.capitalize())
-              for k, c in EDGE_COLORS.items()]
-    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.03),
-             ncol=5, fontsize=7, frameon=False)
-
+    _legend(ax, m, totals=False, ncol=5)
     fig.savefig(out_path, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     return out_path
@@ -158,13 +189,12 @@ def render_pdf_report(
     contact: str = "",
     phone: str = "",
 ) -> str:
-    labels = detail.labels
-    bbox = _roof_bbox(labels)
+    vec = _Vec(m, detail)
     e = m.edges
     today = date.today().strftime("%B %d, %Y")
 
     with PdfPages(out_path) as pdf:
-        # ---- Page 1: cover ----
+        # ---------------- Page 1: cover ----------------
         fig = plt.figure(figsize=(8.5, 11))
         fig.text(0.08, 0.95, "Roof Measurement Report", fontsize=20, fontweight="bold")
         fig.text(0.08, 0.915, m.address, fontsize=12)
@@ -175,14 +205,13 @@ def render_pdf_report(
 
         ax = fig.add_axes([0.08, 0.44, 0.84, 0.40])
         if rgb is not None:
-            y0, y1, x0, x1 = bbox
-            ax.imshow(rgb[y0:y1, x0:x1])
-            _setup = ax.set_title("Aerial Image", fontsize=10, fontweight="bold", loc="left")
+            y0, y1, x0, x1 = [int(v) for v in vec.bbox]
+            ax.imshow(rgb[max(y0, 0):y1, max(x0, 0):x1])
+            ax.set_title("Aerial Image", fontsize=10, fontweight="bold", loc="left")
             ax.axis("off")
         else:
-            _setup_ax(ax, bbox)
-            colors = plt.cm.tab20(np.linspace(0, 1, max(len(detail.facet_ids), 1)))
-            _facet_fill(ax, labels, detail, {l: colors[i] for i, l in enumerate(detail.facet_ids)})
+            _setup_ax(ax, vec.bbox)
+            _draw_roof(ax, vec)
             ax.set_title("Roof Outline", fontsize=10, fontweight="bold", loc="left")
 
         axt = fig.add_axes([0.08, 0.06, 0.84, 0.33])
@@ -207,51 +236,40 @@ def render_pdf_report(
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- Page 2: length diagram ----
+        # ---------------- Page 2: length diagram ----------------
         fig = plt.figure(figsize=(8.5, 11))
         fig.text(0.08, 0.95, "Length Diagram", fontsize=16, fontweight="bold")
         fig.text(0.08, 0.925, m.address, fontsize=9, color="#444444")
         ax = fig.add_axes([0.05, 0.18, 0.90, 0.70])
-        _setup_ax(ax, bbox)
-        _draw_facet_outline(ax, labels, bbox)
-        _draw_edges(ax, detail, label_lengths=True)
-        handles = [Line2D([0], [0], color=c, lw=3,
-                          label=f"{k.capitalize()}s = {getattr(e, k + 's_ft'):,.0f} ft")
-                   for k, c in EDGE_COLORS.items()]
-        ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.02),
-                  ncol=3, fontsize=9, frameon=False)
+        _setup_ax(ax, vec.bbox)
+        _draw_roof(ax, vec, fill="none")
+        _draw_classified_edges(ax, vec, label_lengths=True)
+        _legend(ax, m, totals=True)
         fig.text(0.08, 0.10,
                  "Segment labels shown for edges 5 ft and longer. Lengths are slope-corrected "
                  "where applicable (hips, valleys, rakes).",
                  fontsize=7.5, color="#555555")
-        fig.text(0.08, 0.075,
-                 "Field verify measurements before material order.",
+        fig.text(0.08, 0.075, "Field verify measurements before material order.",
                  fontsize=7.5, color="#555555")
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- Page 3: pitch diagram ----
+        # ---------------- Page 3: pitch diagram ----------------
         fig = plt.figure(figsize=(8.5, 11))
         fig.text(0.08, 0.95, "Pitch Diagram", fontsize=16, fontweight="bold")
         fig.text(0.08, 0.925, f"{m.address}  |  Predominant pitch: {m.predominant_pitch}",
                  fontsize=9, color="#444444")
         ax = fig.add_axes([0.05, 0.15, 0.90, 0.75])
-        _setup_ax(ax, bbox)
-        facet_by_letter = {f.label: f for f in m.facets}
-        pitches = sorted({f.pitch for f in m.facets}, key=lambda p: int(p.split("/")[0]))
-        cmap = plt.cm.Blues(np.linspace(0.25, 0.85, max(len(pitches), 1)))
-        pitch_color = {p: cmap[i] for i, p in enumerate(pitches)}
-        colors_by_letter = {l: pitch_color[facet_by_letter[l].pitch]
-                            for l in detail.facet_ids if l in facet_by_letter}
-        _facet_fill(ax, labels, detail, colors_by_letter)
-        _draw_facet_outline(ax, labels, bbox)
-        for letter, (cy, cx) in detail.facet_centroids.items():
+        _setup_ax(ax, vec.bbox)
+        facet_by_letter, _ = _pitch_colors(m, vec)
+        _draw_roof(ax, vec, fill="#dce8f5")
+        for letter, (cy, cx) in vec.centroids.items():
             f = facet_by_letter.get(letter)
             if f is None or f.surface_area_sqft < 20:
                 continue
             az = math.radians(detail.facet_azimuths.get(letter, 0.0))
-            dy, dx = -math.cos(az), math.sin(az)  # compass -> raster (row 0 = north)
-            dy = -dy  # raster rows grow southward
+            dx, dy = math.sin(az), math.cos(az)  # compass -> raster: north = -y
+            dy = -dy
             L = 14
             ax.annotate("", xy=(cx + dx * L, cy + dy * L), xytext=(cx, cy),
                         arrowprops=dict(arrowstyle="->", color="black", lw=1.0), zorder=4)
@@ -265,18 +283,16 @@ def render_pdf_report(
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- Page 4: area diagram ----
+        # ---------------- Page 4: area diagram ----------------
         fig = plt.figure(figsize=(8.5, 11))
         fig.text(0.08, 0.95, "Area Diagram", fontsize=16, fontweight="bold")
         fig.text(0.08, 0.925,
                  f"{m.address}  |  Total = {m.total_area_sqft:,.0f} sq ft, {m.facet_count} facets",
                  fontsize=9, color="#444444")
         ax = fig.add_axes([0.05, 0.15, 0.90, 0.75])
-        _setup_ax(ax, bbox)
-        colors = plt.cm.Pastel1(np.linspace(0, 1, max(len(detail.facet_ids), 1)))
-        _facet_fill(ax, labels, detail, {l: colors[i] for i, l in enumerate(detail.facet_ids)})
-        _draw_facet_outline(ax, labels, bbox)
-        for letter, (cy, cx) in detail.facet_centroids.items():
+        _setup_ax(ax, vec.bbox)
+        _draw_roof(ax, vec)
+        for letter, (cy, cx) in vec.centroids.items():
             f = facet_by_letter.get(letter)
             if f is None or f.surface_area_sqft < 10:
                 continue
@@ -289,7 +305,7 @@ def render_pdf_report(
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- Page 5: tables ----
+        # ---------------- Page 5: tables ----------------
         fig = plt.figure(figsize=(8.5, 11))
         fig.text(0.08, 0.95, "Report Summary Tables", fontsize=16, fontweight="bold")
 
@@ -321,13 +337,12 @@ def render_pdf_report(
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- Page 6: notes / disclaimer ----
+        # ---------------- Page 6: notes / disclaimer ----------------
         fig = plt.figure(figsize=(8.5, 11))
         fig.text(0.08, 0.95, "Notes & Disclaimer", fontsize=16, fontweight="bold")
         y = 0.90
         for n in m.notes:
-            fig.text(0.08, y, "- " + n, fontsize=9, wrap=True,
-                     verticalalignment="top")
+            fig.text(0.08, y, "- " + n, fontsize=9, wrap=True, verticalalignment="top")
             y -= 0.05
         fig.text(0.08, y - 0.02,
                  "This report was produced from satellite-derived elevation and imagery data.\n"

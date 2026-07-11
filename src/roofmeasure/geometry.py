@@ -32,9 +32,10 @@ from .model import EdgeSummary, Facet, RoofMeasurements, slope_deg_to_pitch
 class EdgeSegment:
     """One classified edge segment, with pixel geometry for diagram rendering."""
     kind: str                  # ridge | hip | valley | eave | rake
-    length_ft: float
+    length_ft: float           # slope-corrected where applicable
     pixels: list               # [(y, x), ...]
     mid_yx: tuple              # label anchor
+    plan_length_ft: float = 0.0  # plan-view length (for diagram scaling)
 
 
 @dataclass
@@ -504,11 +505,12 @@ def measure_from_dsm(
     edge_segments: list[EdgeSegment] = []
     facet_mean_z = {i: s["mean_z"] for i, s in facet_stats.items()}
 
-    def _record(kind: str, cluster: list, length_ft: float):
+    def _record(kind: str, cluster: list, length_ft: float, plan_len_ft: float = 0.0):
         cy = sum(p[0] for p in cluster) / len(cluster)
         cx = sum(p[1] for p in cluster) / len(cluster)
         edge_segments.append(EdgeSegment(kind=kind, length_ft=round(length_ft, 1),
-                                         pixels=cluster, mid_yx=(cy, cx)))
+                                         pixels=cluster, mid_yx=(cy, cx),
+                                         plan_length_ft=round(plan_len_ft or length_ft, 1)))
 
     # ---- classify internal boundaries: ridge / hip / valley ----
     for (i, j), pix in internal.items():
@@ -524,18 +526,18 @@ def measure_from_dsm(
             if not higher:
                 edges.valleys_ft += length_ft
                 edges.valley_count += 1
-                _record("valley", cluster, length_ft)
+                _record("valley", cluster, length_ft, plan_m * M_TO_FT)
             else:
                 # ridge: near-level boundary between opposing slopes
                 level = dz < max(0.6, 0.05 * plan_m)
                 if level:
                     edges.ridges_ft += length_ft
                     edges.ridge_count += 1
-                    _record("ridge", cluster, length_ft)
+                    _record("ridge", cluster, length_ft, plan_m * M_TO_FT)
                 else:
                     edges.hips_ft += length_ft
                     edges.hip_count += 1
-                    _record("hip", cluster, length_ft)
+                    _record("hip", cluster, length_ft, plan_m * M_TO_FT)
 
     # ---- classify perimeter boundaries: eave / rake ----
     # Perimeter pixel runs can turn corners (eave meeting rake), so classify
@@ -571,7 +573,7 @@ def measure_from_dsm(
             length_ft = plan_m * M_TO_FT  # eaves are level: plan length
             edges.eaves_ft += length_ft
             edges.eave_count += 1
-            _record("eave", cluster, length_ft)
+            _record("eave", cluster, length_ft, plan_m * M_TO_FT)
         for cluster in _cluster_pixels(rake_pix):
             plan_m, _, dz = _pca_segment(cluster, z, px_x, px_y)
             if plan_m * M_TO_FT < MIN_EDGE_LEN_FT:
@@ -579,7 +581,7 @@ def measure_from_dsm(
             length_ft = _slope_corrected(plan_m, dz) * M_TO_FT
             edges.rakes_ft += length_ft
             edges.rake_count += 1
-            _record("rake", cluster, length_ft)
+            _record("rake", cluster, length_ft, plan_m * M_TO_FT)
 
     # ---- assemble measurements ----
     order = sorted(ids, key=lambda i: facet_stats[i]["surf_m2"])
