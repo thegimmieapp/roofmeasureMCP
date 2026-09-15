@@ -54,3 +54,146 @@ def measure_address_full(address: str, quality: str = "LOW", radius_m: float = 4
         m = geometry.estimate_from_segments(insights, formatted, lat, lng)
         m.notes.append(f"DSM pipeline unavailable ({type(exc).__name__}: {exc}); used segment-statistics fallback.")
         return m, None, None
+
+
+def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
+    """Build the straight-skeleton roof wireframe and adopt its edge totals.
+
+    The skeleton is a geometrically consistent roof model (ridges parallel to
+    eaves, hips/valleys at corners, all lines meeting at nodes), so its linear
+    measurements supersede the raster-derived edge estimates when available.
+    """
+    import math
+
+    from . import skeleton as skel
+    from . import vectorize
+
+    try:
+        outline = vectorize.outline_polygon(detail, eps_px=11.0)
+        if len(outline) < 3:
+            return
+        outline_edges = vectorize.classify_outline_edges(outline, detail)
+        # classify_outline_edges skips segments < MIN_SEG_PX: rebuild aligned lists
+        kinds = []
+        keep = []
+        for i in range(len(outline)):
+            a, b = outline[i], outline[(i + 1) % len(outline)]
+            match = next((e for e in outline_edges
+                          if np.allclose(e["p0"], a) and np.allclose(e["p1"], b)), None)
+            kinds.append(match["kind"] if match else "eave")
+            keep.append(True)
+        facet_slopes = {f.label: f.slope_deg for f in m.facets}
+        rise = int(m.predominant_pitch.split("/")[0])
+        default_slope = math.degrees(math.atan(rise / 12.0)) if rise else 30.0
+        pitches = skel.edge_pitch_from_dsm(detail, outline, kinds, facet_slopes, default_slope)
+        # Tree-contaminated facets produce outlier slopes that warp the plane
+        # weights: clamp eave pitches to within one pitch class of predominant.
+        lo, hi = default_slope - 8.0, default_slope + 8.0
+        pitches = [min(max(p, lo), hi) for p in pitches]
+        sk = skel.build_skeleton(detail, outline, kinds, pitches, px_m)
+        if not sk.ok or not sk.totals.get("eaves_ft"):
+            return
+        detail.skeleton = sk
+        e = m.edges
+        t = sk.totals
+        e.ridges_ft, e.hips_ft = t["ridges_ft"], t["hips_ft"]
+        e.valleys_ft, e.rakes_ft, e.eaves_ft = t["valleys_ft"], t["rakes_ft"], t["eaves_ft"]
+        e.ridge_count, e.hip_count = t["ridge_count"], t["hip_count"]
+        e.valley_count, e.rake_count, e.eave_count = t["valley_count"], t["rake_count"], t["eave_count"]
+        m.notes.append(
+            "Linear measurements (ridges/hips/valleys/rakes/eaves) come from a "
+            "geometrically consistent roof wireframe model (straight skeleton) fitted "
+            "to the measured footprint and per-facet pitches."
+        )
+    except Exception as exc:
+        m.notes.append(f"Roof wireframe model unavailable ({type(exc).__name__}: {exc}); "
+                       "edge lengths are raster-derived.")
+
+
+def recover_footprint(dsm: np.ndarray, mask: np.ndarray, px_x: float, px_y: float
+                      ) -> tuple[np.ndarray, float]:
+    """Recover the full roof footprint of the center building.
+
+    Google's solar mask excludes tree-shaded / unsuitable roof area, which can
+    badly under-measure a roof. Starting from the mask component nearest the
+    raster center, grow over pixels that are (a) well above local ground level
+    and (b) locally planar (roofs are smooth; tree canopies are rough), then
+    fill enclosed holes.
+
+    Returns (roof_mask, percent_of_final_area_recovered_beyond_google_mask).
+    """
+    h, w = dsm.shape
+
+    # ---- local ground model: blockwise low percentile, lightly smoothed ----
+    B = max(int(12.0 / max(px_x, px_y)), 20)  # ~12 m blocks
+    gh, gw = (h + B - 1) // B, (w + B - 1) // B
+    gblk = np.zeros((gh, gw))
+    for i in range(gh):
+        for j in range(gw):
+            gblk[i, j] = np.percentile(dsm[i * B:(i + 1) * B, j * B:(j + 1) * B], 8)
+    ground = np.kron(gblk, np.ones((B, B)))[:h, :w]
+    for _ in range(2):
+        g2 = ground.copy()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            g2 += np.roll(np.roll(ground, dy, 0), dx, 1)
+        ground = g2 / 5
+    ndsm = dsm - ground
+
+    # ---- roughness: local gradient variance (trees rough, roofs smooth) ----
+    gy, gx = np.gradient(dsm, px_y, px_x)
+
+    def box(a: np.ndarray, k: int = 2) -> np.ndarray:
+        out = np.zeros_like(a)
+        n = 0
+        for dy in range(-k, k + 1):
+            for dx in range(-k, k + 1):
+                out += np.roll(np.roll(a, dy, 0), dx, 1)
+                n += 1
+        return out / n
+
+    gxm, gym = box(gx), box(gy)
+    rough = np.sqrt(box((gx - gxm) ** 2 + (gy - gym) ** 2))
+    grow_ok = (ndsm > 2.0) & (rough < 0.45)
+
+    # ---- grow from the mask component nearest the raster center ----
+    if not mask.any():
+        return mask, 0.0
+    ys, xs = np.where(mask)
+    ci = int(np.argmin((ys - h / 2) ** 2 + (xs - w / 2) ** 2))
+    lab = np.zeros((h, w), dtype=bool)
+    q = deque([(int(ys[ci]), int(xs[ci]))])
+    lab[ys[ci], xs[ci]] = True
+    while q:
+        y, x = q.popleft()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and not lab[ny, nx] and (mask[ny, nx] or grow_ok[ny, nx]):
+                lab[ny, nx] = True
+                q.append((ny, nx))
+
+    # ---- fill enclosed holes (chimneys, skylight dropouts, canopy gaps) ----
+    bg = np.zeros((h, w), dtype=bool)
+    q = deque()
+    for y in range(h):
+        for x in (0, w - 1):
+            if not lab[y, x] and not bg[y, x]:
+                bg[y, x] = True
+                q.append((y, x))
+    for x in range(w):
+        for y in (0, h - 1):
+            if not lab[y, x] and not bg[y, x]:
+                bg[y, x] = True
+                q.append((y, x))
+    while q:
+        y, x = q.popleft()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and not lab[ny, nx] and not bg[ny, nx]:
+                bg[ny, nx] = True
+                q.append((ny, nx))
+    lab |= ~lab & ~bg
+
+    seed_and_grown = int(lab.sum())
+    seed_only = int((lab & mask).sum())
+    grown_pct = 100.0 * (seed_and_grown - seed_only) / max(seed_and_grown, 1)
+    return lab, grown_pct
