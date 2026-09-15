@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "roofmeasure-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Free EagleView-style satellite roof measurements (eaves, rakes, hips, ridges, valleys, pitch, squares with/without waste) plus modular Xactimate-style estimating. MCP server + CLI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Stronghouse Solutions" }]
 keywords = ["roofing", "eagleview", "xactimate", "mcp", "satellite", "measurement", "insurance"]
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.2.0,<2",
     "typer>=0.12",
     "requests>=2.31",
     "numpy>=1.24",
