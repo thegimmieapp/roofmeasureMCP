@@ -34,7 +34,7 @@ class EdgeSegment:
     kind: str                  # ridge | hip | valley | eave | rake
     length_ft: float           # slope-corrected where applicable
     pixels: list               # [(y, x), ...]
-    mid_yx: tuple               # label anchor
+    mid_yx: tuple              # label anchor
     plan_length_ft: float = 0.0  # plan-view length (for diagram scaling)
 
 
