@@ -67,8 +67,11 @@ the report falls back to the plane-intersection wireframe and says so.
 Validated against 27 production-builder roofs in Buckeye AZ, San Tan Valley
 AZ and Richmond TX (Solar API tiles): 11 pass the gate with roof plans that
 match the aerials; the rest fall back, mostly because of jagged footprints,
-patio covers and undetected gable ends. Dependencies: bpypolyskel (GPL,
-installed from GitHub) and mathutils.
+patio covers and undetected gable ends. Dependency: bpypolyskel (GPL,
+pure Python, installed from GitHub). Blender's `mathutils` C extension is not
+required: roofmeasure ships the small subset bpypolyskel needs
+(`src/roofmeasure/_mathutils.py`, double precision), so no compiler is needed
+on macOS or in the Docker image.
 
 **Topology rules** (`wireframe.enforce_topology`): every ridge, hip and
 valley must end where it meets another line. A hip starts at an outline
@@ -171,6 +174,8 @@ connector.
        fly deploy
 
    `fly secrets list` shows the secret name; keep the value you generated.
+   `.github/workflows/fly-deploy.yml` redeploys on every push to main once
+   a `FLY_API_TOKEN` repository secret exists (`fly tokens create deploy`).
 
 2. In claude.ai: Settings > Connectors > Add custom connector, name it
    RoofMeasure and paste `https://roofmeasure-mcp.fly.dev/<secret>/mcp`.

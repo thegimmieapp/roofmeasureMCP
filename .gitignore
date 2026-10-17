@@ -9,3 +9,6 @@ build/
 Google_Maps_API_Key*
 .sync.md5
 .dockerignore
+.connector-secret
+CONNECTOR_URL.txt
+Deploy RoofMeasure.command
