@@ -154,6 +154,40 @@ The estimate tool enforces contractor intake: if homeowner name or date of
 loss are missing it returns `needs_info` so the agent asks the user before
 generating.
 
+## Use from any chat: run it as a remote connector
+
+The plugin above only exists while Claude Desktop is open on the machine
+that has it installed. To use roof-measure from any claude.ai chat (web,
+desktop, mobile), run the same server over HTTPS and add it as a custom
+connector.
+
+1. Deploy (Fly.io shown; any host that runs a Docker container works):
+
+       fly launch --no-deploy --copy-config --name roofmeasure-mcp
+       fly volumes create reports --size 1 --region dfw
+       fly secrets set GOOGLE_MAPS_API_KEY=... \
+           ROOFMEASURE_PATH_SECRET=$(openssl rand -hex 16) \
+           ROOFMEASURE_PUBLIC_URL=https://roofmeasure-mcp.fly.dev
+       fly deploy
+
+   `fly secrets list` shows the secret name; keep the value you generated.
+
+2. In claude.ai: Settings > Connectors > Add custom connector, name it
+   RoofMeasure and paste `https://roofmeasure-mcp.fly.dev/<secret>/mcp`.
+   No OAuth is configured, so the unguessable path segment is the access
+   control: anyone with the full URL can run measurements on your Google
+   key. Rotate the secret (`fly secrets set ROOFMEASURE_PATH_SECRET=...`)
+   if it leaks.
+
+3. Enable the connector in a chat. Tool results now carry
+   `report_pdf_url` / `estimate_url` download links served from the same
+   app (`/<secret>/files/<name>`), since the files are no longer on your
+   own disk. `GET /health` is a public liveness check.
+
+Entry point: `roofmeasure-mcp-http` (Streamable HTTP, stateless, JSON
+responses). Environment: `PORT`, `GOOGLE_MAPS_API_KEY`,
+`ROOFMEASURE_PATH_SECRET`, `ROOFMEASURE_PUBLIC_URL`, `ROOFMEASURE_OUT_DIR`.
+
 ## Use from the command line
 
 ```bash

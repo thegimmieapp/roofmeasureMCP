@@ -44,6 +44,17 @@ def _slug(address: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", address).strip("_")[:60]
 
 
+def _public_url(path: str) -> str:
+    """Download link for a generated file when the server runs remotely
+    (ROOFMEASURE_PUBLIC_URL set); empty when it runs on the user's machine."""
+    base = os.environ.get("ROOFMEASURE_PUBLIC_URL", "").rstrip("/")
+    if not base or not path:
+        return ""
+    secret = os.environ.get("ROOFMEASURE_PATH_SECRET", "").strip("/")
+    prefix = f"{base}/{secret}" if secret else base
+    return f"{prefix}/files/{os.path.basename(path)}"
+
+
 @mcp.tool()
 def measure_roof(address: str, include_outbuildings: bool = False) -> str:
     """Measure a roof from satellite data. Returns full JSON measurements:
@@ -103,7 +114,9 @@ def generate_roof_report(address: str, company: str = "Stronghouse Solutions",
                           company_address=company_address, claim_number=claim_number)
     return json.dumps({
         "report_pdf": pdf_path or "unavailable (segment-statistics fallback; no raster geometry)",
+        "report_pdf_url": _public_url(pdf_path),
         "report_file": out,
+        "report_file_url": _public_url(out),
         "summary": {
             "total_area_sqft": m.total_area_sqft,
             "squares": m.squares,
@@ -257,6 +270,7 @@ def generate_xactimate_estimate(
     )
     totals = xactimate.build_estimate(cfg)
     totals["measurement_method"] = m.method
+    totals["estimate_url"] = _public_url(cfg.out_file)
     totals["squares"] = m.squares
     totals["suggested_waste_pct"] = m.suggested_waste_pct()
     totals["notes"] = m.notes
@@ -295,6 +309,45 @@ def _state_from_address(address: str) -> str:
 
 def main():
     mcp.run()
+
+
+def main_http():
+    """Run as a remote MCP server (Streamable HTTP) so it can be added to
+    claude.ai as a custom connector and used from any chat.
+
+    Environment:
+      PORT                     listen port (default 8080)
+      GOOGLE_MAPS_API_KEY      required
+      ROOFMEASURE_PATH_SECRET  unguessable path segment; the MCP endpoint is
+                               /<secret>/mcp and files are /<secret>/files/<name>
+      ROOFMEASURE_PUBLIC_URL   https://your-app.example.com (for download links)
+      ROOFMEASURE_OUT_DIR      where reports are written (default /data/reports)
+    """
+    from starlette.requests import Request
+    from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
+
+    secret = os.environ.get("ROOFMEASURE_PATH_SECRET", "").strip("/")
+    prefix = f"/{secret}" if secret else ""
+    os.environ.setdefault("ROOFMEASURE_OUT_DIR", "/data/reports")
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = int(os.environ.get("PORT", "8080"))
+    mcp.settings.streamable_http_path = f"{prefix}/mcp"
+    mcp.settings.stateless_http = True
+    mcp.settings.json_response = True
+
+    @mcp.custom_route(f"{prefix}/files/{{name}}", methods=["GET"])
+    async def _serve_file(request: Request):
+        name = os.path.basename(request.path_params["name"])
+        path = os.path.join(_out_dir(), name)
+        if not os.path.isfile(path):
+            return PlainTextResponse("not found", status_code=404)
+        return FileResponse(path, filename=name)
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def _health(_request: Request):
+        return JSONResponse({"ok": True, "service": "roofmeasure-mcp"})
+
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":

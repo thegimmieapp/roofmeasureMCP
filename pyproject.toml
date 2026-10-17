@@ -32,6 +32,7 @@ dev = ["pytest"]
 [project.scripts]
 roofmeasure = "roofmeasure.cli:app"
 roofmeasure-mcp = "roofmeasure.server:main"
+roofmeasure-mcp-http = "roofmeasure.server:main_http"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/roofmeasure"]

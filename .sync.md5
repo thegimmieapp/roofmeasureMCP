@@ -1,8 +1,10 @@
 8fb79d52b7ebe2dd6ce9ceb08ad9c476  ./.gitignore
+f0dc1a0eed307a5fc4715133ae0a24fc  ./Dockerfile
 1cb4409183cd7aee87e126422df9cc6b  ./LICENSE
-749afece914bf30901382640afc21fb8  ./README.md
+d363affdb02d1db43ebcad51aa6ae646  ./README.md
 1f8a70953cfb79b75f6063c3bd770d83  ./SETUP.md
-ab59111b2968eb964a618e4d2eba0d6e  ./pyproject.toml
+e96a2242a811c79a881cbb13c7d86ec4  ./fly.toml
+13fb67270287608224d977816c230c60  ./pyproject.toml
 832c8021e7b9b581fd12596435cfe56e  ./src/roofmeasure/__init__.py
 d2b4551a3e931add56332bed320fa437  ./src/roofmeasure/assets/stronghouse_logo_blue.png
 a6c34e8349505e1503b2e16671573530  ./src/roofmeasure/cli.py
@@ -16,7 +18,7 @@ d676ee24bbe97b22d82065391226f21a  ./src/roofmeasure/planes.py
 fb1e70eccabc34554b89ceeb6e7bab12  ./src/roofmeasure/regularize.py
 83f707ea979f141c90cd5b028bcf7e75  ./src/roofmeasure/report.py
 4dc3c3e2aef78af952f5fa554f5986cd  ./src/roofmeasure/roofgraph.py
-0e0dea5532d50a9686e5e15c9b06560f  ./src/roofmeasure/server.py
+4cefef546802408971f1fd62ec1ba2c0  ./src/roofmeasure/server.py
 d99f3f62bb809ff948d20f9554d62db2  ./src/roofmeasure/solar.py
 5446d7b85f354ffac9935ea507759fc3  ./src/roofmeasure/vectorize.py
 ce416e537dec0ad915c1846a736efd09  ./src/roofmeasure/wireframe.py
