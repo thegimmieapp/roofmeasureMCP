@@ -334,6 +334,30 @@ def main_http():
     mcp.settings.streamable_http_path = f"{prefix}/mcp"
     mcp.settings.stateless_http = True
     mcp.settings.json_response = True
+    # The SDK's DNS-rebinding guard answers 421 to any Host header that is
+    # not on its allow-list, and the list is empty by default, so every
+    # request arriving via the public hostname (*.fly.dev) was refused.
+    # Allow the public host (from ROOFMEASURE_PUBLIC_URL, or
+    # ROOFMEASURE_ALLOWED_HOSTS as a comma list) plus localhost for dev.
+    from urllib.parse import urlparse
+    from mcp.server.transport_security import TransportSecuritySettings
+    hosts = {"localhost:*", "127.0.0.1:*"}
+    origins = {"http://localhost:*", "http://127.0.0.1:*"}
+    pub = urlparse(os.environ.get("ROOFMEASURE_PUBLIC_URL", ""))
+    if pub.hostname:
+        hosts.add(pub.netloc)
+        hosts.add(pub.hostname)
+        origins.add(f"{pub.scheme or 'https'}://{pub.netloc}")
+    for h in os.environ.get("ROOFMEASURE_ALLOWED_HOSTS", "").split(","):
+        h = h.strip()
+        if h:
+            hosts.add(h)
+            origins.add(f"https://{h}")
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=sorted(hosts),
+        allowed_origins=sorted(origins),
+    )
 
     @mcp.custom_route(f"{prefix}/files/{{name}}", methods=["GET"])
     async def _serve_file(request: Request):
