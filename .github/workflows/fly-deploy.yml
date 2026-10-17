@@ -1,19 +1,43 @@
-# See https://fly.io/docs/app-guides/continuous-deployment-with-github-actions/
-
+# Deploys the remote connector to Fly.io on every push to main.
+# One-time setup: in GitHub -> Settings -> Secrets and variables -> Actions,
+# add FLY_API_TOKEN (create it with `fly tokens create deploy -x 999999h`
+# from a machine that is logged in to Fly). Until that secret exists this
+# workflow skips itself instead of failing.
 name: Fly Deploy
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
 jobs:
   deploy:
-    name: Deploy app
+    name: Deploy roofmeasure-mcp
     runs-on: ubuntu-latest
-    concurrency: deploy-group    # optional: ensure only one action runs at a time
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      - name: Check for FLY_API_TOKEN
+        id: token
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "FLY_API_TOKEN secret not set; skipping deploy." >> "$GITHUB_STEP_SUMMARY"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        if: steps.token.outputs.present == 'true'
+      - name: fly deploy
+        if: steps.token.outputs.present == 'true'
+        run: flyctl deploy --remote-only --ha=false
+      - name: Health check
+        if: steps.token.outputs.present == 'true'
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS https://roofmeasure-mcp.fly.dev/health; then exit 0; fi
+            sleep 10
+          done
+          echo "health check failed" && exit 1

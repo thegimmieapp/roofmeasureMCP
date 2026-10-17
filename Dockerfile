@@ -1,6 +1,7 @@
 FROM python:3.12-slim
-# git: bpypolyskel installs from GitHub. gcc/python3-dev: mathutils ships no Linux wheels.
-RUN apt-get update && apt-get install -y --no-install-recommends git build-essential python3-dev \
+# git: bpypolyskel (pure Python) installs from GitHub. No compiler needed:
+# roofmeasure ships its own pure-Python mathutils subset (src/roofmeasure/_mathutils.py).
+RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
