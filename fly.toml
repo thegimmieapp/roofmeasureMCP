@@ -1,24 +1,27 @@
-# fly launch --no-deploy (then edit app name), fly secrets set ..., fly deploy
-app = "roofmeasure-mcp"
-primary_region = "dfw"
+# fly.toml app configuration file generated for roofmeasure-mcp on 2026-10-16T23:52:37-05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'roofmeasure-mcp'
+primary_region = 'dfw'
 
 [build]
-
 [env]
-  PORT = "8080"
-  ROOFMEASURE_OUT_DIR = "/data/reports"
+  PORT = '8080'
+  ROOFMEASURE_OUT_DIR = '/data/reports'
+
+[[mounts]]
+  source = 'reports'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
 
 [[vm]]
-  size = "shared-cpu-2x"
-  memory = "2gb"
-
-[mounts]
-  source = "reports"
-  destination = "/data"
+  size = 'shared-cpu-2x'
+  memory = '2gb'

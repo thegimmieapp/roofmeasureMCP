@@ -6,3 +6,6 @@ build/
 *.docx
 *.md.bak
 .env
+Google_Maps_API_Key*
+.sync.md5
+.dockerignore
