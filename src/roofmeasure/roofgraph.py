@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from itertools import combinations
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -41,9 +42,11 @@ M_TO_FT = 3.280839895
 SQM_TO_SQFT = 10.76391041671
 
 LOW_SLOPE_RISE = 2            # <= 2/12 is a flat section, outside the pitched system
+FLAT_RISE_GAP = 3             # ... and at least this much flatter than the roof around it
 FLAT_MIN_M2 = 6.0             # smaller flat regions are ignored (DSM blur)
 GABLE_MIN_RISE_M = 0.8        # height variation along an edge that marks a gable end
 EAVE_BAND_M = 0.6             # distance inside the outline where eave height is sampled
+SPAN_SNAP_M = 0.7             # a gable span this close to an outline corner shares the corner
 
 
 @dataclass
@@ -71,6 +74,7 @@ class RoofGraph:
     face_azimuth: dict = field(default_factory=dict)
     face_centroids: dict = field(default_factory=dict)
     face_downslope: dict = field(default_factory=dict)
+    face_eave_px: dict = field(default_factory=dict)   # fid -> ((y,x),(y,x)) line the plane rises from
     totals: dict = field(default_factory=dict)
     info: dict = field(default_factory=dict)
     outline: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
@@ -167,11 +171,15 @@ def fit_pitch(dsm: np.ndarray, mask: np.ndarray, px: float, z_eave: float) -> tu
     return rise, t, rms
 
 
-def flat_sections(labels: np.ndarray, planes: dict, px: float) -> np.ndarray:
-    """Mask of low-slope facets large enough to be a real flat section."""
+def flat_sections(labels: np.ndarray, planes: dict, px: float, roof_rise: int | None = None) -> np.ndarray:
+    """Mask of low-slope facets large enough to be a real flat section. A
+    section counts as flat only when it is clearly flatter than the roof
+    around it (FLAT_RISE_GAP): on a 3/12 roof a facet the plane fit calls
+    1/12 is ridge blur, not a porch cover."""
     out = np.zeros(labels.shape, dtype=bool)
     for fid, (a, b, _c) in planes.items():
-        if round(math.hypot(a, b) * 12) <= LOW_SLOPE_RISE:
+        r = round(math.hypot(a, b) * 12)
+        if r <= LOW_SLOPE_RISE and (roof_rise is None or roof_rise - r >= FLAT_RISE_GAP):
             sel = labels == fid
             if sel.sum() * px * px >= FLAT_MIN_M2:
                 out |= sel
@@ -179,21 +187,26 @@ def flat_sections(labels: np.ndarray, planes: dict, px: float) -> np.ndarray:
 
 
 def gable_edges(outline: np.ndarray, dsm: np.ndarray, mask: np.ndarray, z_eave: float,
-                px: float, tan: float) -> set:
-    """Indices of outline edges that are gable ends.
+                px: float, tan: float) -> dict:
+    """Gable ends along the outline: {edge index: (t0, t1, peak_m)}.
 
     Along an eave the roof just inside the edge sits at a constant height.
-    Along a gable end it rises from both corners to the ridge: a tent. The
-    DSM is sampled 1 m inside each edge and tested for that tent shape, with
-    the peak at least a third of what a wing of that width would reach."""
+    Along a gable end it rises from both rakes to the ridge: a tent whose
+    height 1 m inside the edge is pitch x distance from the nearer rake, so
+    the tent's peak gives the gable's width (2 x peak / pitch) and its
+    position gives the centre. A gable can therefore occupy part of a
+    straight eave (a wing whose end wall is flush with the eave beside it);
+    (t0, t1) is that span as fractions along the edge, snapped to the edge
+    ends when within SPAN_SNAP_M of them."""
     n = len(outline)
     h, w = dsm.shape
-    out = set()
+    out: dict = {}
     for e in range(n):
         a = outline[e].astype(float); b = outline[(e + 1) % n].astype(float)
         v = b - a
         L = math.hypot(*v)
-        if L * px < 2.0:
+        Lm = L * px
+        if Lm < GABLE_MIN_EDGE_M:
             continue
         u = v / L
         nrm = np.array([-u[1], u[0]])
@@ -208,7 +221,7 @@ def gable_edges(outline: np.ndarray, dsm: np.ndarray, mask: np.ndarray, z_eave: 
         if inward is None:
             continue
         depth = 1.0 / px
-        ts = np.linspace(0.06, 0.94, max(int(L * px / 0.4), 9))
+        ts = np.linspace(0.03, 0.97, max(int(Lm / 0.3), 12))
         zs = []
         for t in ts:
             p = a + v * t + nrm * inward * depth
@@ -221,21 +234,61 @@ def gable_edges(outline: np.ndarray, dsm: np.ndarray, mask: np.ndarray, z_eave: 
         valid = ~np.isnan(zs)
         if valid.mean() < 0.6:
             continue
-        expected = tan * L * px / 2.0
-        zs = np.clip(zs, -1.0, 1.6 * expected + 0.5)
+        zs = np.clip(zs, -1.0, tan * Lm / 2.0 + 0.8)
         sm = np.array([np.nanmedian(zs[max(i - 1, 0): i + 2]) for i in range(len(zs))])
-        k = len(sm)
-        ends = np.concatenate([sm[: max(k // 5, 2)], sm[-max(k // 5, 2):]])
-        middle = sm[k // 5: k - k // 5] if k >= 10 else sm
-        if np.isnan(ends).all() or np.isnan(middle).all():
-            continue
-        end_lvl = float(np.nanmedian(ends))
-        peak = float(np.nanpercentile(middle, 85))
+        hip_lvl = tan * 1.0                      # height 1 m inside a plain eave
         kmax = int(np.nanargmax(sm))
-        peaked = 0.15 <= ts[kmax] <= 0.85
-        tent = (peak - end_lvl) >= max(0.5, 0.3 * expected) and peaked and end_lvl < 0.4 * peak + 0.2
-        if tent:
-            out.add(e)
+        peak = float(sm[kmax])
+        # the tent must rise clearly above what a hip/eave plane gives there
+        if peak - hip_lvl < max(GABLE_MIN_RISE_M, 0.35 * tan * Lm / 2.0):
+            continue
+        # the span: the tent's flanks have the roof pitch, so each flank is a
+        # line of slope +/-tan. Fitting the flank (points between 25% and 90%
+        # of the peak) and extrapolating to eave level gives the rake position
+        # without depending on the blurred top. One metre inside the edge the
+        # wing plane and the eave plane meet exactly at the valley foot, so
+        # for a flush gable that is where the rake starts; for a wing-wide
+        # gable it lands at the outline corner.
+        xm = ts * Lm
+        lo, hi = 0.25 * peak, 0.9 * peak
+        left = [(xm[i], sm[i]) for i in range(0, kmax) if lo <= sm[i] <= hi and not np.isnan(sm[i])]
+        right = [(xm[i], sm[i]) for i in range(kmax + 1, len(sm)) if lo <= sm[i] <= hi and not np.isnan(sm[i])]
+        if len(left) >= 2:
+            xl = float(np.median([x - z / tan for x, z in left]))
+        else:
+            xl = xm[kmax] - peak / tan
+        if len(right) >= 2:
+            xr = float(np.median([x + z / tan for x, z in right]))
+        else:
+            xr = xm[kmax] + peak / tan
+        t0 = xl / Lm; t1 = xr / Lm
+        if t0 * Lm < SPAN_SNAP_M:
+            t0 = 0.0
+        if (1.0 - t1) * Lm < SPAN_SNAP_M:
+            t1 = 1.0
+        t0 = max(0.0, t0); t1 = min(1.0, t1)
+        if (t1 - t0) * Lm < GABLE_MIN_EDGE_M:
+            continue
+        # the flank fit implies a ridge height; the measured top may be blurred
+        # down but not by more than about 40%
+        h_est = tan * (t1 - t0) * Lm / 2.0
+        if peak < 0.6 * h_est:
+            continue
+        # the profile must really be a tent over the span: the ends of the
+        # span sit near eave level, the quarter points about half the peak
+        def z_at(t):
+            k = int(np.clip(round((t - ts[0]) / (ts[1] - ts[0])), 0, len(sm) - 1))
+            return float(sm[k])
+        q1, q3 = z_at(t0 + 0.25 * (t1 - t0)), z_at(t0 + 0.75 * (t1 - t0))
+        if not (q1 > 0.3 * peak and q3 > 0.3 * peak):
+            continue
+        if t0 > 0.0 and z_at(max(t0 - 0.6 / Lm, 0.0)) > 0.45 * peak:
+            continue                              # does not come back down: not a gable end
+        if t1 < 1.0 and z_at(min(t1 + 0.6 / Lm, 1.0)) > 0.45 * peak:
+            continue
+        if (t1 - t0) * Lm < GABLE_MIN_EDGE_M:
+            continue
+        out[e] = (round(t0, 3), round(t1, 3), round(peak, 2))
     return out
 
 
@@ -254,7 +307,42 @@ def _skeleton(poly_m: np.ndarray, tan: float):
     return V, [list(f) for f in faces]
 
 
+def _valid_ring(outline_px: np.ndarray) -> bool:
+    from shapely.geometry import Polygon
+    if len(outline_px) < 3:
+        return False
+    poly = Polygon(np.column_stack([outline_px[:, 1], -outline_px[:, 0]]))
+    return bool(poly.is_valid and poly.area > 0)
+
+
+def _clean_ring(outline_px: np.ndarray) -> np.ndarray:
+    """Drop repeated vertices and exact back-tracks (A-B-A)."""
+    P = [np.asarray(outline_px[0], float)]
+    for q in outline_px[1:]:
+        q = np.asarray(q, float)
+        if np.hypot(*(q - P[-1])) < 0.5:
+            continue
+        if len(P) >= 2 and np.hypot(*(q - P[-2])) < 0.5:
+            P.pop(); continue
+        P.append(q)
+    if len(P) > 1 and np.hypot(*(P[0] - P[-1])) < 0.5:
+        P.pop()
+    return np.array(P)
+
+
 def simplify_outline(outline_px: np.ndarray, px: float, min_jog_m: float = 1.0) -> np.ndarray:
+    """Jog removal that never returns a self-intersecting ring: the jog
+    threshold is relaxed until the result is a valid polygon, falling back
+    to the cleaned input."""
+    base = _clean_ring(outline_px)
+    for mj in (min_jog_m, min_jog_m * 0.6, min_jog_m * 0.3):
+        cand = _clean_ring(_simplify_outline_raw(base, px, mj))
+        if _valid_ring(cand):
+            return cand
+    return base if _valid_ring(base) else outline_px
+
+
+def _simplify_outline_raw(outline_px: np.ndarray, px: float, min_jog_m: float = 1.0) -> np.ndarray:
     """Remove jogs shorter than min_jog_m from a rectilinear outline: a short
     edge between two parallel edges is deleted and the longer neighbour is
     extended to meet the other (the eave line a framer would snap)."""
@@ -313,55 +401,149 @@ def simplify_outline(outline_px: np.ndarray, px: float, min_jog_m: float = 1.0) 
     return np.array(out) if len(out) >= 3 else P
 
 
-def build_roof_graph(outline_px: np.ndarray, px_x: float, px_y: float, rise: int,
-                     gables: set | None = None) -> RoofGraph:
-    """Ridge / hip / valley / eave / rake graph of a single-pitch roof over
-    the eave outline (Nx2 (y, x) px). `gables` holds outline edge indices
-    that are gable ends.
+def _norm_gables(gables, n: int) -> dict:
+    """Accept a set of edge indices (whole-edge gables) or {e: (t0, t1[, peak])}."""
+    out = {}
+    if not gables:
+        return out
+    if isinstance(gables, dict):
+        for e, v in gables.items():
+            t0, t1 = float(v[0]), float(v[1])
+            if t1 - t0 > 1e-6:
+                out[int(e) % n] = (max(0.0, t0), min(1.0, t1))
+    else:
+        for e in gables:
+            out[int(e) % n] = (0.0, 1.0)
+    return out
 
-    Gable ends are handled by extend-and-clip: the gable edge is pushed
+
+def build_roof_graph(outline_px: np.ndarray, px_x: float, px_y: float, rise: int,
+                     gables=None) -> RoofGraph:
+    """Ridge / hip / valley / eave / rake graph of a single-pitch roof over
+    the eave outline (Nx2 (y, x) px). `gables` is a set of outline edge
+    indices, or {edge: (t0, t1)} with the gable's span along the edge as
+    fractions (a wing end wall flush with the eave beside it).
+
+    Gable ends are handled by extend-and-clip: the gable span is pushed
     outward far enough that the wing's hips fall outside the real outline,
     the hip skeleton is computed, and every face is clipped back to the real
-    outline. The ridge then runs to the gable edge and the side planes meet
-    it along two rakes, which is how the wing is framed."""
+    outline. The ridge then runs to the gable line and the side planes meet
+    it along two rakes, which is how the wing is framed. For a partial
+    gable the pushed span becomes a rectangular tab on the outline; the
+    tab's side faces are the wing's own planes and their boundary with the
+    eave plane beside them is the valley a framer would cut there."""
     from shapely.geometry import Polygon, LineString, Point
-    from shapely.ops import unary_union
 
-    gables = set(gables or ())
     g = RoofGraph()
     n = len(outline_px)
     if n < 3:
         return g
+    gab = _norm_gables(gables, n)
     tan = rise / 12.0
     # metres, y up so that image-CW outlines become CCW consistently
     P = np.column_stack([outline_px[:, 1] * px_x, -outline_px[:, 0] * px_y])
     if _signed_area(P) < 0:
         P = P[::-1].copy()
-        gables = {(n - 2 - e) % n for e in gables}
+        gab = {(n - 2 - e) % n: (1.0 - t1, 1.0 - t0) for e, (t0, t1) in gab.items()}
     real = Polygon(P)
     if not real.is_valid:
-        real = real.buffer(0)
-        if real.geom_type != "Polygon" or real.is_empty:
+        fixed = real.buffer(0)
+        if fixed.geom_type == "MultiPolygon":
+            fixed = max(fixed.geoms, key=lambda q: q.area)
+        if fixed.geom_type != "Polygon" or fixed.is_empty:
             return g
-    # ---- push gable edges outward ----
-    Q = P.copy()
+        # rebuild the vertex list from the repaired ring so indices stay consistent
+        ring = np.array(fixed.exterior.coords[:-1])
+        if _signed_area(ring) < 0:
+            ring = ring[::-1].copy()
+        P = ring; n = len(P); real = Polygon(P)
+        gab = {}                                  # edge indices no longer correspond; gables re-detected next pass
+
+    # ---- build the pushed polygon Q with a source tag per Q edge ----
+    # tag: ("eave", e, t0, t1) a portion of real edge e; ("gable", e) the pushed
+    # gable line; ("side", e) a tab side (the wing plane rises from it)
+    Qv: list = []
+    Qtag: list = []
     gable_lines = []
-    for e in sorted(gables):
+
+    def add(pt, tag):
+        if Qv and np.allclose(Qv[-1], pt, atol=1e-6):
+            return
+        Qv.append(np.asarray(pt, float)); Qtag.append(tag)
+
+    skip_start = False                           # next real edge starts at an already-added pushed corner
+    # walk the outline starting at a plain eave so the wrap-around is never a gable
+    non_gable = [e for e in range(n) if e not in gab]
+    if not non_gable:
+        gab = {}
+        non_gable = [0]
+    off = non_gable[0]
+    for e in [(off + i) % n for i in range(n)]:
         a, b = P[e], P[(e + 1) % n]
-        d = b - a; L = np.hypot(*d)
-        if L < 0.5:
+        d = b - a; L = float(np.hypot(*d))
+        if L < 1e-6:
             continue
-        outward = np.array([d[1], -d[0]]) / L          # right of a CCW edge is outside
-        ext = L / 2.0 + 1.0
-        # do not push into another part of the footprint
-        probe = LineString([tuple((a + b) / 2), tuple((a + b) / 2 + outward * ext)])
-        if probe.crosses(real.exterior) or real.contains(Point((a + b) / 2 + outward * ext)):
+        if e not in gab:
+            if not skip_start:
+                add(a, ("eave", e, 0.0, 1.0))
+            else:
+                Qtag[-1] = ("eave", e, 0.0, 1.0); skip_start = False
             continue
-        Q[e] = Q[e] + outward * ext
-        Q[(e + 1) % n] = Q[(e + 1) % n] + outward * ext
-        gable_lines.append((a.copy(), b.copy(), e))
-    if not Polygon(Q).is_valid:
-        Q = P.copy(); gable_lines = []
+        t0, t1 = gab[e]
+        A = a + d * t0; B = a + d * t1
+        outward = np.array([d[1], -d[0]]) / L      # right of a CCW edge is outside
+        span = float(np.hypot(*(B - A)))
+        ext = span / 2.0 + 1.0
+        # the pushed tab may not overlap the footprint itself (an inside
+        # corner's facing wall); anything outside the footprint, such as a
+        # lower porch or garage roof cut out earlier, is fine
+        tab = Polygon([tuple(A), tuple(B), tuple(B + outward * ext), tuple(A + outward * ext)])
+        if (not tab.is_valid) or tab.intersection(real).area > 0.05 * tab.area:
+            if not skip_start:
+                add(a, ("eave", e, 0.0, 1.0))
+            else:
+                Qtag[-1] = ("eave", e, 0.0, 1.0); skip_start = False
+            continue                              # cannot push into the footprint
+        prev_dir = P[e] - P[(e - 1) % n]; prev_dir /= (np.hypot(*prev_dir) or 1.0)
+        next_dir = P[(e + 2) % n] - P[(e + 1) % n]; next_dir /= (np.hypot(*next_dir) or 1.0)
+        # start of the span
+        if t0 > 1e-6:
+            if not skip_start:
+                add(a, ("eave", e, 0.0, t0))
+            else:
+                Qtag[-1] = ("eave", e, 0.0, t0); skip_start = False
+            add(A, ("side", e))
+        elif float(np.dot(prev_dir, outward)) > 0.95 and not skip_start:
+            pass                                  # previous edge is the wing's side wall: it extends to the pushed corner
+        else:
+            if skip_start:
+                skip_start = False
+            add(A, ("side", e))
+        add(A + outward * ext, ("gable", e))
+        # end of the span
+        if t1 < 1.0 - 1e-6:
+            add(B + outward * ext, ("side", e))
+            add(B, ("eave", e, t1, 1.0))
+        elif float(np.dot(next_dir, -outward)) > 0.95:
+            add(B + outward * ext, None)          # the next real edge (the wing's other wall) starts here
+            skip_start = True
+        else:
+            add(B + outward * ext, ("side", e))
+            add(B, None); skip_start = True       # the next real edge starts at B
+        gable_lines.append((A.copy(), B.copy(), e, t0, t1))
+    if skip_start and Qtag and Qtag[-1] is None:
+        # wrapped around: the pending pushed corner is where edge `off` starts
+        Qtag[-1] = ("eave", off, 0.0, 1.0)
+        Qv.pop(0); Qtag.pop(0)
+    for i in range(len(Qtag)):
+        if Qtag[i] is None:
+            Qtag[i] = ("eave", off, 0.0, 1.0)
+    Q = np.array(Qv)
+    m = len(Q)
+    if m < 3 or not Polygon(Q).is_valid:
+        Q = P.copy(); m = n; gable_lines = []
+        Qtag = [("eave", e, 0.0, 1.0) for e in range(n)]
+    qedge_tag = {i: Qtag[i] for i in range(m)}
     V, faces = _skeleton(Q, tan)
     if not faces:
         return g
@@ -370,7 +552,7 @@ def build_roof_graph(outline_px: np.ndarray, px_x: float, px_y: float, rise: int
     # ---- faces as shapely polygons clipped to the real outline, with their eave line ----
     face_polys = {}
     face_eave = {}
-    face_is_gable = set()
+    face_tag = {}
     for fi, f in enumerate(faces):
         poly = Polygon(V[f, :2])
         if not poly.is_valid:
@@ -382,14 +564,15 @@ def build_roof_graph(outline_px: np.ndarray, px_x: float, px_y: float, rise: int
             clipped = max(clipped.geoms, key=lambda q: q.area)
         if clipped.geom_type != "Polygon":
             continue
-        e = f[0] if (f[0] < n and f[1] < n and (f[0] + 1) % n == f[1]) else None
-        if e is None:
+        qe = f[0] if (f[0] < m and f[1] < m and (f[0] + 1) % m == f[1]) else None
+        if qe is None:
             continue
-        if any(ge == e for _a, _b, ge in gable_lines):
-            face_is_gable.add(fi)                     # the pushed gable face: its clipped remnant is nothing real
-            continue
+        tag = qedge_tag[qe]
+        if tag[0] == "gable":
+            continue                              # the pushed gable face: nothing real
         face_polys[fi] = clipped
-        face_eave[fi] = (Q[e], Q[(e + 1) % n])
+        face_eave[fi] = (Q[qe], Q[(qe + 1) % m])
+        face_tag[fi] = tag
 
     def face_z(fi, pt):
         a, b = face_eave[fi]
@@ -401,7 +584,6 @@ def build_roof_graph(outline_px: np.ndarray, px_x: float, px_y: float, rise: int
 
     # ---- interior edges: shared boundaries between faces ----
     fids = sorted(face_polys)
-    seen = set()
     for i, fa in enumerate(fids):
         for fb in fids[i + 1:]:
             inter = face_polys[fa].boundary.intersection(face_polys[fb].boundary)
@@ -426,47 +608,57 @@ def build_roof_graph(outline_px: np.ndarray, px_x: float, px_y: float, rise: int
                 length = math.hypot(ln.length, zb - za)
                 g.edges.append(GEdge(kind, to_px(pa), to_px(pb), round(length * M_TO_FT, 1),
                                      round(ln.length * M_TO_FT, 1), (fa, fb)))
-    # ---- outline edges: eaves, or two rakes per gable end split at the ridge foot ----
-    gable_idx = {e: (a, b) for a, b, e in gable_lines}
-    # which face owns outline edge e (its eave line is Q[e]-Q[e+1])
-    owner = {}
+    # ---- outline edges: eave portions, and two rakes per gable span split at the ridge foot ----
+    owner = {}                                     # (e, t0, t1) -> face
     for fi in fids:
-        a, b = face_eave[fi]
-        for e in range(n):
-            if np.allclose(a, Q[e]) and np.allclose(b, Q[(e + 1) % n]):
-                owner[e] = fi
+        tg = face_tag[fi]
+        if tg[0] == "eave":
+            owner[(tg[1], round(tg[2], 3), round(tg[3], 3))] = fi
+    spans = {e: (t0, t1) for _A, _B, e, t0, t1 in gable_lines}
     for e in range(n):
         a, b = P[e], P[(e + 1) % n]
-        L = float(np.hypot(*(b - a)))
+        d = b - a
+        L = float(np.hypot(*d))
         if L < 1e-6:
             continue
-        if e in gable_idx:
-            # the ridge foot: the ridge endpoint lying on this edge
-            seg = LineString([tuple(a), tuple(b)])
-            foot = None
-            for ed in g.edges:
-                if ed.kind != "ridge":
-                    continue
-                for pt in (ed.p0, ed.p1):
-                    pm = np.array([pt[1] * px_x, -pt[0] * px_y])
-                    if seg.distance(Point(pm)) < 0.08:
-                        foot = pm
-            if foot is None:
-                foot = (a + b) / 2.0
-            # height at the foot from a neighbouring face plane
-            zf = 0.0
-            for fi in fids:
-                if face_polys[fi].distance(Point(foot)) < 0.1:
-                    zf = max(zf, face_z(fi, foot))
-            for p0, p1 in ((a, foot), (foot, b)):
-                plan = float(np.hypot(*(p1 - p0)))
-                if plan < 0.05:
-                    continue
-                g.edges.append(GEdge("rake", to_px(p0), to_px(p1), round(math.hypot(plan, zf) * M_TO_FT, 1),
-                                     round(plan * M_TO_FT, 1), (owner.get(e),)))
-        else:
+        if e not in spans:
             g.edges.append(GEdge("eave", to_px(a), to_px(b), round(L * M_TO_FT, 1), round(L * M_TO_FT, 1),
-                                 (owner.get(e),)))
+                                 (owner.get((e, 0.0, 1.0)),)))
+            continue
+        t0, t1 = spans[e]
+        A = a + d * t0; B = a + d * t1
+        if t0 > 1e-6:
+            g.edges.append(GEdge("eave", to_px(a), to_px(A), round(t0 * L * M_TO_FT, 1), round(t0 * L * M_TO_FT, 1),
+                                 (owner.get((e, 0.0, round(t0, 3))),)))
+        # the ridge foot: the ridge endpoint lying on the gable line
+        seg = LineString([tuple(A), tuple(B)])
+        foot = None
+        for ed in g.edges:
+            if ed.kind != "ridge":
+                continue
+            for pt in (ed.p0, ed.p1):
+                pm = np.array([pt[1] * px_x, -pt[0] * px_y])
+                if seg.distance(Point(pm)) < 0.08:
+                    foot = pm
+        if foot is None:
+            foot = (A + B) / 2.0
+        zf = 0.0
+        for fi in fids:
+            if face_polys[fi].distance(Point(foot)) < 0.1:
+                zf = max(zf, face_z(fi, foot))
+        for p0, p1 in ((A, foot), (foot, B)):
+            plan = float(np.hypot(*(p1 - p0)))
+            if plan < 0.05:
+                continue
+            own = None
+            for fi in fids:
+                if face_polys[fi].distance(LineString([tuple(p0), tuple(p1)]).centroid) < 0.1:
+                    own = fi; break
+            g.edges.append(GEdge("rake", to_px(p0), to_px(p1), round(math.hypot(plan, zf) * M_TO_FT, 1),
+                                 round(plan * M_TO_FT, 1), (own,)))
+        if t1 < 1.0 - 1e-6:
+            g.edges.append(GEdge("eave", to_px(B), to_px(b), round((1 - t1) * L * M_TO_FT, 1),
+                                 round((1 - t1) * L * M_TO_FT, 1), (owner.get((e, round(t1, 3), 1.0)),)))
     # ---- faces ----
     slope = math.degrees(math.atan(tan))
     for fi in fids:
@@ -486,8 +678,10 @@ def build_roof_graph(outline_px: np.ndarray, px_x: float, px_y: float, rise: int
         g.face_downslope[fi] = (-dsy, dsx)          # (drow, dcol)
         c = poly.centroid
         g.face_centroids[fi] = to_px((c.x, c.y))
-    g.info = {"rise": rise, "gables": sorted(e for _a, _b, e in gable_lines), "gables_requested": sorted(gables),
-              "n_outline": n}
+        g.face_eave_px[fi] = (to_px(a), to_px(b))
+    g.info = {"rise": rise, "gables": sorted(e for _a, _b, e, _t0, _t1 in gable_lines),
+              "gable_spans": {int(e): (round(t0, 2), round(t1, 2)) for _a, _b, e, t0, t1 in gable_lines},
+              "gables_requested": sorted(gab), "n_outline": n}
     _totals(g)
     return g
 
@@ -570,6 +764,8 @@ GABLE_MIN_EDGE_M = 2.5        # a gable end is a wing's full width, never a shor
 PEEL_MIN_M2 = 12.0            # a lower roof level must be at least this big ...
 PEEL_MIN_STEP_M = 0.4         # ... and sit behind a real step in the elevation model
 MAX_PEEL_DEPTH = 2
+MAX_GABLE_CANDIDATES = 4      # gable hypotheses tested in combination (2^4 plans)
+PLANE_GABLE_CREDIT_M = 0.10   # fit-score credit for a gable the fitted planes also show
 
 
 def _components(mask: np.ndarray):
@@ -623,14 +819,21 @@ def consensus_rise(labels: np.ndarray, planes: dict, region: np.ndarray, px: flo
 
 
 def rake_edges_from_planes(outline: np.ndarray, labels: np.ndarray, planes: dict,
-                           px_x: float, px_y: float) -> set:
+                           px_x: float, px_y: float, spans: dict | None = None) -> set:
     """Outline edges that are gable ends: the facet plane just inside the
-    edge slopes ALONG the edge (a rake) over most of its length."""
+    edge slopes ALONG the edge (a rake) over most of its length. With
+    `spans` ({e: (t0, t1, ...)}) only those edges are tested and only the
+    span is sampled."""
     n = len(outline)
     h, w = labels.shape
     out = set()
-    for e in range(n):
-        a = outline[e].astype(float); b = outline[(e + 1) % n].astype(float)
+    for e in (sorted(spans) if spans is not None else range(n)):
+        a0 = outline[e].astype(float); b0 = outline[(e + 1) % n].astype(float)
+        if spans is not None:
+            t0, t1 = float(spans[e][0]), float(spans[e][1])
+            a = a0 + (b0 - a0) * t0; b = a0 + (b0 - a0) * t1
+        else:
+            a, b = a0, b0
         v = b - a; L = math.hypot(*v)
         if L * (px_x + px_y) / 2 < 1.5:
             continue
@@ -676,7 +879,7 @@ def rasterize_model(g: RoofGraph, mask: np.ndarray, px_x: float, px_y: float, z_
 
     h, w = mask.shape
     model = np.full((h, w), np.nan)
-    eave_of_face = {}
+    eave_of_face = {fid: (np.asarray(a, float), np.asarray(b, float)) for fid, (a, b) in g.face_eave_px.items()}
     for e in g.edges:
         if e.kind in ("eave", "flashing") and e.faces and e.faces[0] is not None:
             eave_of_face.setdefault(e.faces[0], (np.asarray(e.p0, float), np.asarray(e.p1, float)))
@@ -740,11 +943,12 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
     have_planes = labels is not None and planes is not None
     # ---- stage A: flat sections from the fitted planes ----
     if have_planes and not force_flat:
-        flats = flat_sections(labels, planes, px) & main
+        r_roof = consensus_rise(labels, planes, main, px)
+        flats = flat_sections(labels, planes, px, r_roof) & main
         lab, comps = _components(flats)
         if comps:
             ze0 = eave_height(dsm, main, px)
-            r0 = consensus_rise(labels, planes, main, px)
+            r0 = r_roof
             tan0 = (r0 or 6) / 12.0
             grow_ok = main & ((gm < 0.5 * tan0) | (dsm <= ze0 + 0.25) | ((gm > 1.6 * tan0) & (d_orig <= 1.2)))
             for cid, cnt in comps:
@@ -767,9 +971,9 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
     # at least pitch x distance above the eave; a region sitting far below
     # that, more than 1 m in from the edge, is a flat cover (porch, patio,
     # carport) under or against the main roof ----
-    if not force_flat:
+    r0 = consensus_rise(labels, planes, main, px) if have_planes else None
+    if not force_flat and (r0 is None or r0 >= LOW_SLOPE_RISE + FLAT_RISE_GAP):
         ze0 = eave_height(dsm, main, px)
-        r0 = consensus_rise(labels, planes, main, px) if have_planes else None
         if r0 is None:
             r0, _t, _r = fit_pitch(dsm, main, px, ze0)
         tan0 = max(r0, 3) / 12.0
@@ -805,6 +1009,14 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
         if len(outline) < 3:
             return g
         outline = simplify_outline(outline, px, MIN_JOG_M)
+        if not _valid_ring(outline):
+            from shapely.geometry import Polygon
+            fixed = Polygon(np.column_stack([outline[:, 1], -outline[:, 0]])).buffer(0)
+            if fixed.geom_type == "MultiPolygon":
+                fixed = max(fixed.geoms, key=lambda q: q.area)
+            if fixed.geom_type == "Polygon" and not fixed.is_empty:
+                ring = np.array(fixed.exterior.coords[:-1])
+                outline = np.column_stack([-ring[:, 1], ring[:, 0]])
         ze = eave_height(dsm, main, px)
         rise = consensus_rise(labels, planes, main, px) if have_planes else None
         fit_rise, fit_tan, fit_rms = fit_pitch(dsm, main, px, ze)
@@ -818,15 +1030,52 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
         tan = rise / 12.0
         nn = len(outline)
         elen = {e: math.hypot(*(outline[(e + 1) % nn] - outline[e])) * px for e in range(nn)}
-        gab = gable_edges(outline, dsm, main, ze, px, tan)
+        spans = gable_edges(outline, dsm, main, ze, px, tan)
         if have_planes:
-            # both the DSM tent profile and the fitted planes must call it a gable
-            gab &= rake_edges_from_planes(outline, labels, planes, px_x, px_y)
-        gab = {e for e in gab if elen[e] >= GABLE_MIN_EDGE_M}
-        g = build_roof_graph(outline, px_x, px_y, rise, gab)
-        if not g.ok:
-            return g
-        model = rasterize_model(g, main, px_x, px_y, ze, tan)
+            # the fitted planes are a second, independent gable detector: a
+            # plane that slopes along an outline edge is a rake. Edges it
+            # flags join the candidate set as whole-edge gables; the
+            # elevation fit below decides which hypotheses survive.
+            for e in rake_edges_from_planes(outline, labels, planes, px_x, px_y):
+                if e not in spans and elen[e] >= GABLE_MIN_EDGE_M:
+                    spans[e] = (0.0, 1.0, tan * elen[e] / 2.0)
+            confirmed = rake_edges_from_planes(outline, labels, planes, px_x, px_y, spans)
+            # rank: candidates both detectors agree on first, then by tent height
+            spans = {e: (v[0], v[1], v[2] + (10.0 if e in confirmed else 0.0)) for e, v in spans.items()}
+        # ---- gables are hypotheses: build every combination of the candidates
+        # (strongest MAX_GABLE_CANDIDATES) and keep the plan the elevation
+        # model agrees with best; the plain hip plan is always a candidate ----
+        cands = sorted(spans, key=lambda e: -spans[e][2])[:MAX_GABLE_CANDIDATES]
+        best = None
+        for k in range(len(cands) + 1):
+            for combo in combinations(cands, k):
+                gab_try = {e: spans[e] for e in combo}
+                g_try = build_roof_graph(outline, px_x, px_y, rise, gab_try)
+                if not g_try.ok or not g_try.totals.get("eaves_ft"):
+                    continue
+                model_try = rasterize_model(g_try, main, px_x, px_y, ze, tan)
+                sel = main & np.isfinite(model_try) & (d_orig > 0.4)
+                if sel.sum() < 0.6 * main.sum():
+                    continue
+                r = (dsm - model_try)[sel]
+                p90 = float(np.percentile(np.abs(r), 90)); rms = float(np.sqrt(np.mean(r * r)))
+                # prefer the simpler plan on a pure tie, but a gable the fitted
+                # planes identify (a rake plane along the edge) is evidence the
+                # height fit alone cannot see at low pitch: credit it
+                n_conf = sum(1 for e in combo if spans[e][2] >= 10.0)
+                score = p90 + 0.5 * rms + 0.02 * k - PLANE_GABLE_CREDIT_M * n_conf
+                if best is None or score < best[0]:
+                    best = (score, g_try, model_try, gab_try, p90, rms)
+        if best is None:
+            g = build_roof_graph(outline, px_x, px_y, rise, {})
+            if not g.ok:
+                return g
+            model = rasterize_model(g, main, px_x, px_y, ze, tan)
+            gab = {}
+        else:
+            _score, g, model, gab, _p90, _rms = best
+        g.info["gable_candidates"] = {int(e): spans[e] for e in cands}
+        g.info["gables_chosen"] = {int(e): spans[e] for e in gab}
         resid = dsm - model
         d = _edt(main, px)
         low = main & (d > 0.3) & np.isfinite(resid) & (resid < -LOWER_SECTION_DROP_M)
@@ -906,6 +1155,52 @@ def _merge_sub(g: RoofGraph, sub: RoofGraph, main_mask: np.ndarray, px: float, b
         nf = base_fid + fid
         g.faces[nf] = sub.faces[fid]
         for attr in ("face_plan_sqft", "face_area_sqft", "face_pitch", "face_slope_deg", "face_azimuth",
-                     "face_centroids", "face_downslope"):
-            getattr(g, attr)[nf] = getattr(sub, attr)[fid]
+                     "face_centroids", "face_downslope", "face_eave_px"):
+            if fid in getattr(sub, attr):
+                getattr(g, attr)[nf] = getattr(sub, attr)[fid]
     g.info.setdefault("levels", []).append(sub.info)
+
+
+# ------------------------------------------------------------ plan support test
+
+def plan_support(plan_edges, plane_edges, px: float, tol_m: float = 1.0) -> dict:
+    """How well the measured plane intersections support a framed plan.
+
+    Both inputs are edge lists with .kind, .p0, .p1 in raster px. Only
+    ridges, hips and valleys count (the lines generated by the plan). For
+    each framed crease, points every 0.5 m along it are tested for lying
+    within tol_m of any measured crease; `support` is the supported fraction
+    of framed crease length. `coverage` is the converse: the fraction of
+    measured crease length that lies near a framed crease. A plan the
+    planes agree with scores high on both; a plan that invents hips where
+    the roof has gables scores low on support."""
+    kinds = ("ridge", "hip", "valley")
+    A = [(np.asarray(e.p0, float), np.asarray(e.p1, float)) for e in plan_edges if e.kind in kinds]
+    B = [(np.asarray(e.p0, float), np.asarray(e.p1, float)) for e in plane_edges if e.kind in kinds]
+    if not A or not B:
+        return {"support": 0.0, "coverage": 0.0, "plan_len_m": 0.0, "plane_len_m": 0.0}
+
+    def samples(segs):
+        pts = []
+        for a, b in segs:
+            L = float(np.hypot(*(b - a))) * px
+            k = max(int(L / 0.5), 1)
+            for i in range(k + 1):
+                pts.append(a + (b - a) * (i / k))
+        return np.array(pts)
+
+    def seg_dist(pts, segs):
+        d = np.full(len(pts), np.inf)
+        for a, b in segs:
+            ab = b - a; L2 = float(ab @ ab) or 1e-9
+            t = np.clip(((pts - a) @ ab) / L2, 0.0, 1.0)
+            proj = a + t[:, None] * ab
+            d = np.minimum(d, np.hypot(*(pts - proj).T))
+        return d * px
+
+    pa = samples(A); pb = samples(B)
+    sup = float((seg_dist(pa, B) <= tol_m).mean())
+    cov = float((seg_dist(pb, A) <= tol_m).mean())
+    la = sum(float(np.hypot(*(b - a))) for a, b in A) * px
+    lb = sum(float(np.hypot(*(b - a))) for a, b in B) * px
+    return {"support": round(sup, 3), "coverage": round(cov, 3), "plan_len_m": round(la, 1), "plane_len_m": round(lb, 1)}

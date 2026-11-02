@@ -49,29 +49,55 @@ a wall and stays a step. A side-by-side section at a different pitch on the
 same slope (Tony Russell's 7/12 insert on a 10/12 roof) is kept and its
 sides are walls (step flashing), as EagleView draws it.
 
-**Framing model** (`src/roofmeasure/roofgraph.py`, v0.4.0): the primary
-line generator. Instead of intersecting fitted planes, it generates the
-ridge / hip / valley graph from the eave line the way a framer lays it out:
-every plane rises from its eave at one pitch, so hips run at 45 degrees from
-outside corners, valleys run from inside corners to the eaves, ridges sit
-centred over each wing, a narrower wing's ridge ends where its valleys meet
-and ties to the main ridge with a short hip (the straight skeleton of the
-eave polygon, computed with bpypolyskel). The elevation model supplies only
-what geometry cannot: the pitch (consensus of the fitted planes), gable ends
-(a tent-shaped height profile along the edge, confirmed by the planes),
-flat or lower sections (carports, porches, lower wings: cut out as their own
-level with flashing along the wall), and a fit check. The graph is
-connected by construction. It is used when the elevation model agrees with
-it within 24 in at the 90th percentile (18 in rms, 12 in bias); otherwise
-the report falls back to the plane-intersection wireframe and says so.
-Validated against 27 production-builder roofs in Buckeye AZ, San Tan Valley
-AZ and Richmond TX (Solar API tiles): 11 pass the gate with roof plans that
-match the aerials; the rest fall back, mostly because of jagged footprints,
-patio covers and undetected gable ends. Dependency: bpypolyskel (GPL,
-pure Python, installed from GitHub). Blender's `mathutils` C extension is not
-required: roofmeasure ships the small subset bpypolyskel needs
-(`src/roofmeasure/_mathutils.py`, double precision), so no compiler is needed
-on macOS or in the Docker image.
+**Framing plan** (`src/roofmeasure/roofgraph.py`, v0.5.0): the line
+generator for every report. Instead of intersecting fitted planes, it
+generates the ridge / hip / valley graph from the eave line the way a
+framer lays it out: every plane rises from its eave at one pitch, so hips
+run at 45 degrees from outside corners, valleys run from inside corners to
+the eaves, ridges sit centred over each wing, a narrower wing's ridge ends
+where its valleys meet and ties to the main ridge with a short hip (the
+straight skeleton of the eave polygon, computed with bpypolyskel). Every
+line ends where it meets another line, no line is drawn twice, and no hip
+starts anywhere but a corner, by construction. The elevation model supplies
+only what geometry cannot: the pitch (consensus of the fitted planes),
+gable ends, lower sections (porches, carports) and a fit check.
+
+Gable ends are hypotheses, not verdicts. Two detectors propose them: the
+elevation profile one metre inside an eave (a tent whose flanks have the
+roof pitch; the flank fit gives the gable's width and position, so a gable
+can occupy part of a straight eave when a wing's end wall is flush with
+the eave beside it) and the fitted planes (a plane sloping along the edge
+is a rake). Every combination of the candidates is built and the plan the
+elevation data agrees with best is kept, with the plain hip plan always in
+the running. A flush gable produces the valley a framer would cut from the
+gable corner up to the ridge.
+
+The plan is used when the measured planes support it: at least 70% of the
+framed ridge/hip/valley length lies within 1 m of a measured plane crease
+and the plan does not invent more than 1.6x the measured crease length
+(or the elevation residual is within 24 in at the 90th percentile). Its
+confidence is reported (confirmed, or MEDIUM with the residual). On a
+MEDIUM plan, where the measured planes contain more than 15% more crease
+length than the framed plan draws, the larger ridge/hip/valley totals are
+reported for ordering and the note says so; the diagram stays framed.
+Where the planes do not support the plan (several levels and pitches the
+single-pitch model does not describe), lines come from the measured plane
+intersections cleaned to the same construction rules
+(`wireframe.sanitize_creases`: duplicate near-parallel creases removed,
+collinear ridge pieces merged, hips moved to the nearest outline corner or
+dropped) and then the topology repair below. Dependency: bpypolyskel (GPL,
+pure Python, installed from GitHub). Blender's `mathutils` C extension is
+not required: roofmeasure ships the small subset bpypolyskel needs
+(`src/roofmeasure/_mathutils.py`, double precision), so no compiler is
+needed on macOS or in the Docker image.
+
+Calibration (six EagleView reports, Springfield MO, measured values):
+Jenny R142/142 ft, hips 0/0, rakes 158/160; Joe hips 397/401, valleys
+214/239; Tony ridge+hip 172/176, valleys 130/129; Fred and Andy are MEDIUM
+plans (Fred hips 278/216 after the ordering check, Andy 153/189); Lynda is
+canopy-bound and low confidence. 3669 W Maplewood (the report that
+prompted v0.5): framed plan confirmed within 20 in, 2 gables, R73 H161
+V120, replacing a plane wireframe that drew duplicate hips and valleys.
 
 **Topology rules** (`wireframe.enforce_topology`): every ridge, hip and
 valley must end where it meets another line. A hip starts at an outline

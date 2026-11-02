@@ -331,6 +331,9 @@ def _building_center_px(shape, lat, lng, px_x, px_y, insights):
 FRAMING_FIT_P90_M = 0.60     # framing model accepted when the DSM agrees this closely (90th pct)
 FRAMING_FIT_RMS_M = 0.45
 FRAMING_FIT_BIAS_M = 0.30
+FRAMING_MIN_SUPPORT = 0.70   # share of framed ridge/hip/valley length lying on measured plane creases
+FRAMING_MAX_LEN_RATIO = 1.6
+FRAMING_ORDER_BUMP = 1.15    # measured creases above this x the framed figure are reported instead  # framed crease length may not exceed the measured crease length by more
 
 
 def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
@@ -362,9 +365,11 @@ def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
             if restored:
                 detail.labels = wfm.extend_labels_to_outline(detail.labels, outline)
         wf = wfm.build_wireframe(detail.labels, detail.planes, outline, detail.px_x, detail.px_y)
+        plane_wf = wf                          # the measured-plane wireframe, kept for the ordering check
         # ---- framing model first: the graph derived from the eave line the way
         # the roof is framed, kept when it fits the elevation model ----
         framing_note = None
+        framing_confirmed = False
         try:
             from . import roofgraph as rgm
             foot = (detail.labels > 0)
@@ -377,24 +382,62 @@ def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
             p90 = fit.get("p90_m", 9.9); rms = fit.get("fit_rms_m", 9.9); bias = abs(fit.get("bias_m", 9.9))
             mask_px = float((detail.labels > 0).sum())
             area_ratio = g.totals.get("plan_area_sqft", 0) / max(mask_px * detail.px_x * detail.px_y * 10.76391, 1.0)
-            if g.ok and p90 <= FRAMING_FIT_P90_M and rms <= FRAMING_FIT_RMS_M and bias <= FRAMING_FIT_BIAS_M \
-                    and 0.85 <= area_ratio <= 1.15 and g.totals.get("eaves_ft"):
+            # The framed plan is the only line generator that can satisfy the
+            # construction rules (every hip from a corner, every line ending at
+            # a junction, no duplicates), so it is used whenever it exists and
+            # covers the footprint. The elevation agreement is reported as the
+            # confidence of the plan, never as a reason to draw the measured
+            # plane intersections instead.
+            support = rgm.plan_support(g.edges, wf.edges, px_m) if g.ok else {"support": 0.0, "coverage": 0.0,
+                                                                             "plan_len_m": 0.0, "plane_len_m": 0.0}
+            len_ratio = support["plan_len_m"] / max(support["plane_len_m"], 1.0)
+            supported = (support["support"] >= FRAMING_MIN_SUPPORT and len_ratio <= FRAMING_MAX_LEN_RATIO) \
+                or (p90 <= FRAMING_FIT_P90_M and rms <= FRAMING_FIT_RMS_M and bias <= FRAMING_FIT_BIAS_M)
+            if g.ok and 0.80 <= area_ratio <= 1.20 and g.totals.get("eaves_ft") and supported:
                 g.outline = outline
                 g.polys_ready = True
                 wf = g
+                gables = fit.get("gables_chosen") or {}
+                gable_txt = (f"{len(gables)} gable end(s) where the elevation data shows a tent profile"
+                             if gables else "no gable ends (all hips)")
+                agree = f"{p90 * 3.28084 * 12:.0f} in (90th percentile), rms {rms * 3.28084 * 12:.0f} in"
+                framing_confirmed = p90 <= FRAMING_FIT_P90_M and rms <= FRAMING_FIT_RMS_M and bias <= FRAMING_FIT_BIAS_M
+                if framing_confirmed:
+                    conf = f"the elevation model confirms it within {agree}."
+                else:
+                    conf = (f"the elevation model agrees with it within {agree}, which is looser than "
+                            "usual: a pitch change, a lower section or tree cover is likely. Field verify "
+                            "ridge and valley lengths before ordering.")
+                    m.notes.append("Framing-plan confidence: MEDIUM (elevation agreement " + agree + ").")
                 framing_note = (
-                    "Roof model: framing model. Ridges, hips and valleys are generated from the eave "
+                    "Roof model: framing plan. Ridges, hips and valleys are generated from the eave "
                     "line the way the roof is framed (hips from outside corners, valleys from inside "
-                    f"corners to the eaves, one pitch of {fit.get('rise')}/12, gable ends where the "
-                    "elevation data shows them); the elevation model confirms it within "
-                    f"{p90 * 3.28084 * 12:.0f} in (90th percentile)."
+                    f"corners to the eaves, one pitch of {fit.get('rise')}/12, {gable_txt}); " + conf
                 )
             else:
+                why = []
+                if not g.ok or not g.totals.get("eaves_ft"):
+                    why.append("no plan could be built from the footprint")
+                else:
+                    if not (0.80 <= area_ratio <= 1.20):
+                        why.append(f"plan area {area_ratio:.2f}x the footprint")
+                    if not supported:
+                        why.append(f"the measured planes support {support['support'] * 100:.0f}% of the framed "
+                                   f"lines ({support['plan_len_m'] * 3.28084:.0f} ft of lines vs "
+                                   f"{support['plane_len_m'] * 3.28084:.0f} ft measured)")
                 m.notes.append(
-                    "Framing model did not fit this roof (90th percentile residual "
-                    f"{p90 * 3.28084 * 12:.0f} in, rms {rms * 3.28084 * 12:.0f} in); lines come from the "
-                    "measured plane intersections instead. Expect more line segments than a framed plan."
+                    "Framing plan not used (" + "; ".join(why) + "): this roof has sections the "
+                    "single-pitch framing model does not describe (several levels, pitches or gable "
+                    "wings). Lines come from the measured plane intersections, cleaned to the "
+                    "construction rules (duplicate lines removed, hips moved to corners, dangling "
+                    "ends joined). Field verify ridge, hip and valley lengths."
                 )
+                tp = getattr(wf, "topology", {}) or {}
+                fixes = {k: tp.get(k, 0) for k in ("duplicates_removed", "hips_snapped", "hips_dropped",
+                                                    "ridges_merged", "extended", "dropped")}
+                if any(fixes.values()):
+                    m.notes.append("Construction-rule repairs on the measured lines: " +
+                                   ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in fixes.items() if v) + ".")
         except Exception as exc:  # the framing model must never break a report
             m.notes.append(f"Framing model unavailable ({type(exc).__name__}: {exc}); lines come from measured plane intersections.")
         if not wf.ok or not wf.totals.get("eaves_ft"):
@@ -419,6 +462,27 @@ def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
         detail.skeleton = wf
         e.ridges_ft, e.hips_ft = t["ridges_ft"], t["hips_ft"]
         e.valleys_ft, e.rakes_ft, e.eaves_ft = t["valleys_ft"], t["rakes_ft"], t["eaves_ft"]
+        # ---- ordering safety: the framed plan is the minimum line set a roof
+        # can have. Where the measured plane creases total clearly more
+        # (a lower section or extra wing the single-pitch plan simplified),
+        # order from the larger figure and say so; the diagram stays framed.
+        if framing_note and not framing_confirmed and plane_wf is not wf and plane_wf.ok:
+            pt = plane_wf.totals
+            bumped = []
+            keys = (("ridges_ft", "ridges"), ("hips_ft", "hips"), ("valleys_ft", "valleys"))
+            framed_total = sum(t.get(k, 0) for k, _l in keys)
+            plane_total = sum(pt.get(k, 0) for k, _l in keys)
+            if plane_total > FRAMING_ORDER_BUMP * framed_total:
+                for key, label in keys:
+                    if pt.get(key, 0) > t.get(key, 0) + 5:
+                        bumped.append(f"{label} {t[key]:.0f} -> {pt[key]:.0f} ft")
+                        setattr(e, key, pt[key])
+            if bumped:
+                m.notes.append(
+                    "Ordering check: the measured roof planes contain more crease length than the framed "
+                    "plan draws (" + ", ".join(bumped) + "). The larger figures are reported for ordering; "
+                    "the diagram shows the framed plan. Field verify these lines."
+                )
         e.flashing_ft = t.get("flashing_ft", 0.0)
         e.step_flashing_ft = t.get("step_flashing_ft", 0.0)
         e.ridge_count, e.hip_count = t["ridge_count"], t["hip_count"]

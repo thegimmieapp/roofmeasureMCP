@@ -610,8 +610,11 @@ def build_wireframe(labels: np.ndarray, planes: dict, outline: np.ndarray,
     for ci, c in enumerate(creases):
         c["p0"] = tuple(nodes[assign[2 * ci]]); c["p1"] = tuple(nodes[assign[2 * ci + 1]])
 
+    # ---- construction rules: no duplicate lines, hips start at corners ----
+    creases, san = sanitize_creases(creases, outline, px_x, px_y)
     # ---- framing topology: every line meets another line at a point ----
     creases, wf.topology = enforce_topology(creases, outline, labels, px_x, px_y)
+    wf.topology.update(san)
 
     # ---- build crease edges (recompute 3D length after snapping) ----
     for c in creases:
@@ -970,3 +973,139 @@ def facet_polygons(labels: np.ndarray, wf: Wireframe, px_m: float) -> dict:
                 P = simp
             out[fid] = P
     return out
+
+
+# ------------------------------------------------------------ construction rules
+
+DUP_ANGLE_DEG = 12.0        # creases this close to parallel ...
+DUP_LATERAL_M = 0.7         # ... and this close side by side are one line drawn twice
+HIP_CORNER_SNAP_M = 2.5     # a hip's low end this close to an outline corner is that corner
+RIDGE_MERGE_GAP_M = 1.0     # collinear ridge pieces this close end to end are one ridge
+
+
+def _lateral_overlap(a0, a1, b0, b1):
+    """(max lateral distance of b's ends from line a, overlap fraction of b on a)."""
+    d = a1 - a0; L = float(np.hypot(*d))
+    if L < 1e-9:
+        return np.inf, 0.0
+    u = d / L
+    def cross2(p, q):
+        return p[0] * q[1] - p[1] * q[0]
+    lat = max(abs(cross2(u, b0 - a0)), abs(cross2(u, b1 - a0)))
+    t0, t1 = sorted((float((b0 - a0) @ u), float((b1 - a0) @ u)))
+    ov = max(0.0, min(t1, L) - max(t0, 0.0))
+    Lb = float(np.hypot(*(b1 - b0))) or 1e-9
+    return lat, ov / Lb
+
+
+def sanitize_creases(creases: list, outline: np.ndarray, px_x: float, px_y: float) -> tuple[list, dict]:
+    """Apply the rules a roof must satisfy before the lines are drawn:
+
+      * a line is never drawn twice: two creases that are near-parallel and
+        side by side within DUP_LATERAL_M over most of the shorter one are one
+        line (the measured planes split a facet in two); the shorter copy goes;
+      * collinear ridge pieces that touch end to end are one ridge;
+      * a hip starts at an outline corner. A hip whose low end sits on the
+        eave line away from any corner cannot exist (the planes split where
+        the roof does not); its low end is moved to the corner when one is
+        within HIP_CORNER_SNAP_M, otherwise the line is dropped and the
+        topology pass closes whatever it left open."""
+    px = (px_x + px_y) / 2.0
+    info = dict(duplicates_removed=0, hips_snapped=0, hips_dropped=0, ridges_merged=0)
+    out_pts = outline.astype(float)
+    n_out = len(outline)
+    kinds = ("ridge", "hip", "valley")
+
+    def P(c):
+        return np.asarray(c["p0"], float), np.asarray(c["p1"], float)
+
+    def plan_m(c):
+        a, b = P(c)
+        return math.hypot((b[0] - a[0]) * px_y, (b[1] - a[1]) * px_x)
+
+    def angle(c1, c2):
+        a0, a1 = P(c1); b0, b1 = P(c2)
+        u = a1 - a0; v = b1 - b0
+        nu, nv = np.hypot(*u), np.hypot(*v)
+        if nu < 1e-9 or nv < 1e-9:
+            return 90.0
+        cs = abs(float(u @ v)) / (nu * nv)
+        return math.degrees(math.acos(max(-1.0, min(1.0, cs))))
+
+    # 1. duplicates
+    live = [c for c in creases if c["kind"] in kinds and not c.get("_drop")]
+    live.sort(key=plan_m, reverse=True)
+    for i, big in enumerate(live):
+        if big.get("_drop"):
+            continue
+        a0, a1 = P(big)
+        for small in live[i + 1:]:
+            if small.get("_drop") or angle(big, small) > DUP_ANGLE_DEG:
+                continue
+            b0, b1 = P(small)
+            lat, ov = _lateral_overlap(a0, a1, b0, b1)
+            if lat * px <= DUP_LATERAL_M and ov >= 0.5:
+                small["_drop"] = True
+                info["duplicates_removed"] += 1
+
+    # 2. collinear ridge merge
+    changed = True
+    while changed:
+        changed = False
+        ridges = [c for c in creases if c["kind"] == "ridge" and not c.get("_drop")]
+        for i, r1 in enumerate(ridges):
+            for r2 in ridges[i + 1:]:
+                if angle(r1, r2) > 5.0:
+                    continue
+                a0, a1 = P(r1); b0, b1 = P(r2)
+                lat, _ov = _lateral_overlap(a0, a1, b0, b1)
+                if lat * px > 0.5:
+                    continue
+                gap = min(np.hypot(*(p - q)) for p in (a0, a1) for q in (b0, b1)) * px
+                if gap <= RIDGE_MERGE_GAP_M:
+                    pts = [a0, a1, b0, b1]
+                    u = (a1 - a0) / (np.hypot(*(a1 - a0)) or 1.0)
+                    proj = [float((p - a0) @ u) for p in pts]
+                    lo, hi = pts[int(np.argmin(proj))], pts[int(np.argmax(proj))]
+                    r1["p0"], r1["p1"] = tuple(lo), tuple(hi)
+                    r2["_drop"] = True
+                    info["ridges_merged"] += 1
+                    changed = True
+                    break
+            if changed:
+                break
+
+    # 3. hips start at outline corners
+    def nearest_corner(p):
+        d = np.hypot(out_pts[:, 0] - p[0], out_pts[:, 1] - p[1])
+        k = int(np.argmin(d))
+        return k, float(d[k]) * px
+
+    def dist_outline(p):
+        best = np.inf
+        for e in range(n_out):
+            d, _q = _point_segment_dist(p, out_pts[e], out_pts[(e + 1) % n_out])
+            best = min(best, d)
+        return best * px
+
+    for c in creases:
+        if c["kind"] != "hip" or c.get("_drop"):
+            continue
+        a, b = P(c)
+        za = _plane_z(c["planes"][0], a[1] * px_x, a[0] * px_y) if c.get("planes") else 0.0
+        zb = _plane_z(c["planes"][0], b[1] * px_x, b[0] * px_y) if c.get("planes") else 0.0
+        low_key = "p0" if za <= zb else "p1"
+        low = a if low_key == "p0" else b
+        if dist_outline(low) > 1.5:
+            continue                                  # low end is interior (hip to a lower ridge): fine
+        k, dk = nearest_corner(low)
+        if dk <= 0.3:
+            continue
+        if dk <= HIP_CORNER_SNAP_M:
+            c[low_key] = tuple(out_pts[k])
+            info["hips_snapped"] += 1
+        else:
+            c["_drop"] = True
+            info["hips_dropped"] += 1
+    kept = [c for c in creases if not c.get("_drop")]
+    return kept, info
