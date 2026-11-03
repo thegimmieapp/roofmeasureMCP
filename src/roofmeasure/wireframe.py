@@ -243,9 +243,38 @@ def complete_occluded_corners(poly: np.ndarray, dsm: np.ndarray, ground: np.ndar
         dirs.append(v / L if L > 1e-9 else np.array([0.0, 0.0]))
     orient = float(np.sum(poly[:, 1] * np.roll(poly[:, 0], -1) - np.roll(poly[:, 1], -1) * poly[:, 0]))
     sign = 1.0 if orient > 0 else -1.0
-    is_long = [L >= long_m for L in lens]
+    # the building axis: direction of the longest edge; an edge more than
+    # 12 degrees off both axes is a diagonal, which a rectilinear house does
+    # not have (a bay is handled elsewhere): under canopy it is the tree line
+    k_ax = int(np.argmax(lens))
+    ax_dir = dirs[k_ax]
+    def off_axis(k):
+        c = abs(float(dirs[k] @ ax_dir))
+        return min(math.degrees(math.acos(max(-1.0, min(1.0, c)))), 90.0 - math.degrees(math.acos(max(-1.0, min(1.0, c)))))
+    is_diag = [off_axis(k) > 12.0 and lens[k] > 0.3 for k in range(n)]
+    is_long = [L >= long_m and not is_diag[k] for k, L in enumerate(lens)]
     if sum(is_long) < 2:
         return poly, 0
+
+    def canopy_outside(k):
+        """Median height above ground 1.5 m outside edge k (tree canopy is tall)."""
+        a, b = pts[k], pts[(k + 1) % n]
+        v = b - a; L = math.hypot(*v)
+        if L < 1e-9:
+            return 0.0
+        u = v / L
+        nrm = np.array([-u[1], u[0]])
+        mid = (a + b) / 2.0
+        probe = mid + nrm * (1.0 / px_m)
+        if MplPath(poly[:, ::-1]).contains_point((probe[1], probe[0])):
+            nrm = -nrm                                  # that side is inside: outward is the other
+        vals = []
+        for t in (0.25, 0.5, 0.75):
+            p = a + v * t + nrm * (1.5 / px_m)
+            y, x = int(round(p[0])), int(round(p[1]))
+            if 0 <= y < h and 0 <= x < w:
+                vals.append(float(dsm[y, x] - ground[y, x]))
+        return float(np.median(vals)) if vals else 0.0
 
     restored = 0
     k = 0
@@ -266,11 +295,21 @@ def complete_occluded_corners(poly: np.ndarray, dsm: np.ndarray, ground: np.ndar
         while not is_long[j] and len(run) < n - 2:
             run.append(j)
             j = (j + 1) % n
-        if not run or j == k or any(lens[r] > short_m for r in run):
+        if not run or j == k:
             k = (k + 1) % n
             if k == 0 and guard > n:
                 break
             continue
+        # a run edge is either a short jog or a diagonal; and the run must be
+        # canopy-bound (most of its edges have tall vegetation right outside)
+        if any(lens[r] > short_m and not is_diag[r] for r in run):
+            k = (k + 1) % n
+            if k == 0 and guard > n:
+                break
+            continue
+        can = [canopy_outside(r) for r in run]
+        canopy_run = sum(1 for c in can if c > 2.5) >= max(1, (len(run) + 1) // 2)
+        tall = float(np.median(can)) if can else 0.0
         d1, d2 = dirs[k], dirs[j]
         if abs(d1 @ d2) > 0.3:             # need perpendicular long edges
             k = (k + 1) % n
@@ -294,7 +333,9 @@ def complete_occluded_corners(poly: np.ndarray, dsm: np.ndarray, ground: np.ndar
         region = np.array([pts[r] for r in run] + [b, corner])
         rx, ry = region[:, 1], region[:, 0]
         area_m2 = abs(float(np.sum(rx * np.roll(ry, -1) - np.roll(rx, -1) * ry))) / 2.0 * px_m * px_m
-        if area_m2 < 0.5 or area_m2 > max_area_m2:
+        # a tall canopy can hide a whole corner of a house
+        area_cap = max_area_m2 if not canopy_run else (max_area_m2 * 3.0 if tall > 4.0 else max_area_m2 * 2.0)
+        if area_m2 < 0.5 or area_m2 > area_cap:
             k = (k + 1) % n
             if k == 0 and guard > n:
                 break
@@ -311,7 +352,7 @@ def complete_occluded_corners(poly: np.ndarray, dsm: np.ndarray, ground: np.ndar
             k = (k + 1) % n
             continue
         nd = (dsm[y0:y1, x0:x1] - ground[y0:y1, x0:x1])[inside]
-        if float(np.median(nd)) <= 2.0:
+        if float(np.median(nd)) <= 2.0 and not canopy_run:
             k = (k + 1) % n
             if k == 0 and guard > n:
                 break
@@ -1109,3 +1150,218 @@ def sanitize_creases(creases: list, outline: np.ndarray, px_x: float, px_y: floa
             info["hips_dropped"] += 1
     kept = [c for c in creases if not c.get("_drop")]
     return kept, info
+
+
+# ------------------------------------------------------------ canopy completion
+
+CANOPY_TALL_M = 2.5          # height above ground 1.5 m outside an edge that marks tree canopy
+CANOPY_OFF_AXIS_DEG = 12.0   # an outline edge further off both building axes is not a wall line
+CANOPY_MAX_GAIN = 0.45       # a completion may add at most this fraction of the visible area
+
+
+def complete_canopy_runs(poly: np.ndarray, dsm: np.ndarray, ground: np.ndarray, px_m: float,
+                         axis_deg: float | None = None) -> tuple[np.ndarray, int, float]:
+    """Replace tree-line outline runs by the rectilinear eave line they hide.
+
+    A house outline is straight lines on two axes; the satellite footprint
+    follows the tree canopy where it overhangs the roof. An outline edge is
+    UNTRUSTED when it runs off both building axes (a diagonal) or when tall
+    vegetation stands right outside it. Each maximal run of untrusted edges
+    between two trusted edges A and B is replaced by the rectilinear path
+    that extends A to the outermost extent the run reaches on that side,
+    follows that side, and returns to B: a cut-off corner becomes the corner,
+    a side pushed inward by canopy is pushed back out to where a trusted
+    corner says the roof reaches. The path always encloses every visible
+    roof pixel (the roof is at least what can be seen) and never adds more
+    than CANOPY_MAX_GAIN of the visible area. Returns (poly, runs_completed,
+    area_added_m2)."""
+    from matplotlib.path import Path as MplPath
+
+    n0 = len(poly)
+    if n0 < 4:
+        return poly, 0, 0.0
+    h, w = dsm.shape
+    pts = [poly[k].astype(float) for k in range(n0)]
+    ctr = np.mean(pts, axis=0)
+    if axis_deg is None:
+        lens0 = [math.hypot(*(pts[(k + 1) % n0] - pts[k])) for k in range(n0)]
+        k_ax = int(np.argmax(lens0))
+        v = pts[(k_ax + 1) % n0] - pts[k_ax]
+        axis_deg = math.degrees(math.atan2(v[0], v[1]))
+    th = math.radians(axis_deg)
+    # rotate into the axis frame (u along the axis, v across it)
+    ca, sa = math.cos(th), math.sin(th)
+
+    def to_uv(p):
+        y, x = p[0] - ctr[0], p[1] - ctr[1]
+        return np.array([x * ca + y * sa, -x * sa + y * ca])
+
+    def to_yx(q):
+        u, v = q
+        return np.array([ctr[0] + (u * sa + v * ca), ctr[1] + (u * ca - v * sa)])
+
+    P = [to_uv(p) for p in pts]
+    orient = float(np.sum(poly[:, 1] * np.roll(poly[:, 0], -1) - np.roll(poly[:, 1], -1) * poly[:, 0]))
+    mpl = MplPath(poly[:, ::-1])
+
+    def outside_height(k):
+        a, b = pts[k], pts[(k + 1) % len(pts)]
+        d = b - a; L = math.hypot(*d)
+        if L < 1e-9:
+            return 0.0
+        u = d / L
+        nrm = np.array([-u[1], u[0]])
+        mid = (a + b) / 2.0
+        probe = mid + nrm * (1.0 / px_m)
+        if mpl.contains_point((probe[1], probe[0])):
+            nrm = -nrm
+        vals = []
+        for t in (0.2, 0.5, 0.8):
+            for dist in (1.0, 1.8):
+                q = a + d * t + nrm * (dist / px_m)
+                y, x = int(round(q[0])), int(round(q[1]))
+                if 0 <= y < h and 0 <= x < w:
+                    vals.append(float(dsm[y, x] - ground[y, x]))
+        return float(np.median(vals)) if vals else 0.0
+
+    def edge_dir_uv(k):
+        d = P[(k + 1) % len(P)] - P[k]
+        L = float(np.hypot(*d))
+        return d / L if L > 1e-9 else np.array([0.0, 0.0]), L * px_m
+
+    trusted = []
+    for k in range(n0):
+        d, L = edge_dir_uv(k)
+        if L < 0.3:
+            trusted.append(False); continue
+        off = math.degrees(math.atan2(abs(d[1]), abs(d[0])))
+        off = min(off, 90.0 - off)
+        trusted.append(off <= CANOPY_OFF_AXIS_DEG and outside_height(k) <= CANOPY_TALL_M)
+    if sum(trusted) < 2 or all(trusted):
+        return poly, 0, 0.0
+
+    def area_uv(Q):
+        Q = np.asarray(Q)
+        return abs(float(np.sum(Q[:, 0] * np.roll(Q[:, 1], -1) - np.roll(Q[:, 0], -1) * Q[:, 1]))) / 2.0
+
+    base_area = area_uv(P)
+    # the roof's own top: canopy that hides roof must stand above it
+    yy0, yy1 = int(max(poly[:, 0].min(), 0)), int(min(poly[:, 0].max() + 1, h))
+    xx0, xx1 = int(max(poly[:, 1].min(), 0)), int(min(poly[:, 1].max() + 1, w))
+    ridge_nd = 0.0
+    if yy1 - yy0 >= 2 and xx1 - xx0 >= 2:
+        yy, xx = np.mgrid[yy0:yy1, xx0:xx1]
+        ins = mpl.contains_points(np.column_stack([xx.ravel(), yy.ravel()])).reshape(yy.shape)
+        if ins.sum() >= 50:
+            ridge_nd = float(np.nanpercentile((dsm[yy0:yy1, xx0:xx1] - ground[yy0:yy1, xx0:xx1])[ins], 95))
+    completed = 0
+    added_px = 0.0
+    # walk runs; rebuild the vertex list run by run
+    k = 0
+    guard = 0
+    while guard < 4 * n0 and len(P) >= 4:
+        guard += 1
+        n = len(P)
+        if not trusted[k] or trusted[(k + 1) % n]:
+            k = (k + 1) % n
+            if k == 0 and guard > n:
+                break
+            continue
+        # run of untrusted edges after trusted edge k
+        run = []
+        j = (k + 1) % n
+        while not trusted[j] and len(run) < n - 2:
+            run.append(j); j = (j + 1) % n
+        if not run or j == k:
+            k = (k + 1) % n
+            continue
+        dA, _ = edge_dir_uv(k)           # direction of A (ends at vertex run[0])
+        dB, _ = edge_dir_uv(j)           # direction of B (starts at vertex j)
+        a_end = P[run[0]]
+        b_start = P[j]
+        run_pts = [P[r] for r in run] + [b_start]
+        # outward: away from the centroid along A's direction beyond a_end
+        axis_a = 0 if abs(dA[0]) >= abs(dA[1]) else 1          # A runs along u (0) or v (1)
+        sgn_a = 1.0 if dA[axis_a] > 0 else -1.0
+        side = 1 - axis_a                                       # the side coordinate the run lies on
+        # how far the run reaches along A's direction (the side's true position):
+        # only run vertices lying between A's line and B's line count, so a
+        # separate lower block further along the outline cannot pull the eave
+        bl = b_start[1 - axis_a]; al = a_end[1 - axis_a]
+        lo, hi = (min(al, bl), max(al, bl))
+        between = [q for q in run_pts if lo - 1e-6 <= q[1 - axis_a] <= hi + 1e-6]
+        reach = max([sgn_a * (q[axis_a] - a_end[axis_a]) for q in between] or [0.0])
+        reach = max(reach, 0.0)
+        perp = abs(dB[axis_a]) < 0.5                            # B is perpendicular to A
+        new_path = []
+        if perp:
+            # corner at A's line extended `reach` beyond a_end, then along the side to B
+            c1 = a_end.copy(); c1[axis_a] += sgn_a * reach
+            c2 = b_start.copy(); c2[axis_a] = c1[axis_a]
+            new_path = [c1] if np.allclose(c2, b_start) else [c1, c2]
+            # the side coordinate must not retreat inside visible pixels: it is
+            # already the outermost reach by construction
+        else:
+            # B parallel to A: connect with a perpendicular at the outermost reach
+            c1 = a_end.copy(); c1[axis_a] += sgn_a * reach
+            c2 = b_start.copy(); c2[axis_a] = c1[axis_a]
+            new_path = [c1, c2]
+        cand = []
+        for idx in range(n):
+            if idx in run:
+                continue
+            if idx == j:
+                cand.extend(new_path)
+            cand.append(P[idx])
+        cand = [q for i, q in enumerate(cand) if i == 0 or not np.allclose(q, cand[i - 1], atol=1e-6)]
+        gain = area_uv(cand) - area_uv(P)
+        if gain < 0.0 or gain > CANOPY_MAX_GAIN * base_area:
+            k = (k + 1) % n
+            continue
+        # the gained region must not be visible ground (median height above ground > 1.5 m)
+        poly_yx = np.array([to_yx(q) for q in cand])
+        yy0, yy1 = int(max(poly_yx[:, 0].min(), 0)), int(min(poly_yx[:, 0].max() + 1, h))
+        xx0, xx1 = int(max(poly_yx[:, 1].min(), 0)), int(min(poly_yx[:, 1].max() + 1, w))
+        if yy1 - yy0 >= 2 and xx1 - xx0 >= 2 and gain > 0.5:
+            yy, xx = np.mgrid[yy0:yy1, xx0:xx1]
+            ins_new = MplPath(poly_yx[:, ::-1]).contains_points(np.column_stack([xx.ravel(), yy.ravel()])).reshape(yy.shape)
+            ins_old = mpl.contains_points(np.column_stack([xx.ravel(), yy.ravel()])).reshape(yy.shape)
+            gained = ins_new & ~ins_old
+            if gained.sum() >= 4:
+                nd = (dsm[yy0:yy1, xx0:xx1] - ground[yy0:yy1, xx0:xx1])[gained]
+                # hidden roof is under something that stands above the roof; low
+                # ground, shrubs, or a tree beside the house is not hidden roof
+                over = nd > max(CANOPY_TALL_M, ridge_nd + 0.5)
+                if float(np.median(nd)) <= CANOPY_TALL_M or float(over.mean()) < 0.5:
+                    k = (k + 1) % n
+                    continue
+        # accept
+        new_trusted = []
+        for idx in range(n):
+            if idx in run:
+                continue
+            if idx == j:
+                new_trusted.extend([True] * len(new_path))
+            new_trusted.append(trusted[idx])
+        # rebuild with dedupe in the same order as cand
+        P2, T2 = [], []
+        raw = []
+        for idx in range(n):
+            if idx in run:
+                continue
+            if idx == j:
+                raw.extend([(q, True) for q in new_path])
+            raw.append((P[idx], trusted[idx]))
+        for q, t in raw:
+            if P2 and np.allclose(q, P2[-1], atol=1e-6):
+                continue
+            P2.append(q); T2.append(t)
+        P, trusted = P2, T2
+        pts = [to_yx(q) for q in P]
+        mpl = MplPath(np.array(pts)[:, ::-1])
+        added_px += gain
+        completed += 1
+        k = 0
+        guard = 0
+    out = np.array([to_yx(q) for q in P])
+    return out, completed, float(added_px * px_m * px_m)

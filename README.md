@@ -99,6 +99,22 @@ canopy-bound and low confidence. 3669 W Maplewood (the report that
 prompted v0.5): framed plan confirmed within 20 in, 2 gables, R73 H161
 V120, replacing a plane wireframe that drew duplicate hips and valleys.
 
+**Tree canopy** (v0.5.1): the footprint follows the canopy where trees
+overhang the roof, and a tree line is never a roof line. An outline edge is
+untrusted when it runs off both building axes or when tall vegetation
+stands right outside it; each run of untrusted edges between two trusted
+edges is replaced by the rectilinear eave line (`wireframe.complete_canopy_runs`):
+extend the trusted eave, follow the side at the outermost extent a trusted
+corner establishes, return to the next trusted edge. A cut-off corner
+becomes the corner; a whole side pushed inward by canopy is pushed back out.
+The completed strip must be hidden by something standing above the ridge
+(a tree beside the house is not hidden roof), may not exceed 45% of the
+visible area, and its elevation is never used for pitch, gable profiles or
+the fit (`generate_roof(known=...)`); the plan-support test ignores lines
+under canopy. Any remaining off-axis edge is replaced by the two axis
+edges through the outside corner (`roofgraph.rectilinearize`). The report
+states how much plan area was recovered.
+
 **Topology rules** (`wireframe.enforce_topology`): every ridge, hip and
 valley must end where it meets another line. A hip starts at an outline
 corner and ends at the point that begins a ridge; a valley starts at the

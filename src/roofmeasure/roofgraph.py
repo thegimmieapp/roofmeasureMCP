@@ -138,21 +138,28 @@ def _edt(mask: np.ndarray, px: float) -> np.ndarray:
 
 # ------------------------------------------------------------ DSM queries
 
-def eave_height(dsm: np.ndarray, mask: np.ndarray, px: float) -> float:
-    """Median elevation in the band just inside the outline (the eave line)."""
+def eave_height(dsm: np.ndarray, mask: np.ndarray, px: float, known: np.ndarray | None = None) -> float:
+    """Median elevation in the band just inside the outline (the eave line).
+    `known` limits the samples to pixels whose elevation is roof (not canopy)."""
     d = _edt(mask, px)
-    band = mask & (d > 0.15) & (d <= EAVE_BAND_M)
+    k = mask if known is None else (mask & known)
+    band = k & (d > 0.15) & (d <= EAVE_BAND_M)
     if band.sum() < 20:
-        band = mask & (d <= EAVE_BAND_M * 2)
+        band = k & (d <= EAVE_BAND_M * 2)
+    if band.sum() < 20:
+        band = mask & (d > 0.15) & (d <= EAVE_BAND_M)
     return float(np.median(dsm[band])) if band.any() else float(np.median(dsm[mask]))
 
 
-def fit_pitch(dsm: np.ndarray, mask: np.ndarray, px: float, z_eave: float) -> tuple[int, float, float]:
+def fit_pitch(dsm: np.ndarray, mask: np.ndarray, px: float, z_eave: float,
+              known: np.ndarray | None = None) -> tuple[int, float, float]:
     """Fit rise/12 of a single-pitch hip roof: height above the eave is
     pitch x distance to the outline. Returns (rise, tan, rms_m) with the
     integer rise, the fitted tangent, and the fit residual."""
     d = _edt(mask, px)
     sel = mask & (d > 0.8)
+    if known is not None and (sel & known).sum() >= 50:
+        sel = sel & known
     if sel.sum() < 50:
         sel = mask & (d > 0.3)
     dd = d[sel]; zz = dsm[sel] - z_eave
@@ -914,7 +921,8 @@ def rasterize_model(g: RoofGraph, mask: np.ndarray, px_x: float, px_y: float, z_
 def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
                   axis_hint: float | None = None, depth: int = 0,
                   labels: np.ndarray | None = None, planes: dict | None = None,
-                  force_flat: bool = False, ground: np.ndarray | None = None) -> RoofGraph:
+                  force_flat: bool = False, ground: np.ndarray | None = None,
+                  known: np.ndarray | None = None) -> RoofGraph:
     """Full framing-model roof for one footprint.
 
     1. Flat sections known from the fitted planes are cut out first (stage A).
@@ -932,6 +940,11 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
     px = (px_x + px_y) / 2.0
     g = RoofGraph()
     main = roof.copy()
+    # `known`: footprint pixels whose elevation is the roof itself. Under tree
+    # canopy the footprint is completed from the house geometry and the DSM
+    # there is tree top: those pixels shape the outline but never the eave
+    # height, pitch, gable profiles, fit residual or lower-level search.
+    known = np.ones_like(roof, dtype=bool) if known is None else (known.astype(bool))
     if ground is not None and depth == 0:
         # nothing lower than about 6 ft above ground is roof: drop the ground
         # strips, fences and shadows the footprint recovery can pick up
@@ -947,7 +960,7 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
         flats = flat_sections(labels, planes, px, r_roof) & main
         lab, comps = _components(flats)
         if comps:
-            ze0 = eave_height(dsm, main, px)
+            ze0 = eave_height(dsm, main, px, known)
             r0 = r_roof
             tan0 = (r0 or 6) / 12.0
             grow_ok = main & ((gm < 0.5 * tan0) | (dsm <= ze0 + 0.25) | ((gm > 1.6 * tan0) & (d_orig <= 1.2)))
@@ -973,12 +986,12 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
     # carport) under or against the main roof ----
     r0 = consensus_rise(labels, planes, main, px) if have_planes else None
     if not force_flat and (r0 is None or r0 >= LOW_SLOPE_RISE + FLAT_RISE_GAP):
-        ze0 = eave_height(dsm, main, px)
+        ze0 = eave_height(dsm, main, px, known)
         if r0 is None:
-            r0, _t, _r = fit_pitch(dsm, main, px, ze0)
+            r0, _t, _r = fit_pitch(dsm, main, px, ze0, known)
         tan0 = max(r0, 3) / 12.0
         d0 = _edt(main, px)
-        core = main & (d0 > 1.0) & ((dsm - ze0) < 0.5 * tan0 * d0 - 0.05) & (gm < 0.5 * tan0)
+        core = main & known & (d0 > 1.0) & ((dsm - ze0) < 0.5 * tan0 * d0 - 0.05) & (gm < 0.5 * tan0)
         lab, comps = _components(core)
         grow_ok = main & ((gm < 0.5 * tan0) | (dsm <= ze0 + 0.25) | ((gm > 1.6 * tan0) & (d_orig <= 1.2)))
         added = False
@@ -1009,6 +1022,7 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
         if len(outline) < 3:
             return g
         outline = simplify_outline(outline, px, MIN_JOG_M)
+        outline = rectilinearize(outline, axis_hint, px=px)
         if not _valid_ring(outline):
             from shapely.geometry import Polygon
             fixed = Polygon(np.column_stack([outline[:, 1], -outline[:, 0]])).buffer(0)
@@ -1017,9 +1031,9 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
             if fixed.geom_type == "Polygon" and not fixed.is_empty:
                 ring = np.array(fixed.exterior.coords[:-1])
                 outline = np.column_stack([-ring[:, 1], ring[:, 0]])
-        ze = eave_height(dsm, main, px)
+        ze = eave_height(dsm, main, px, known)
         rise = consensus_rise(labels, planes, main, px) if have_planes else None
-        fit_rise, fit_tan, fit_rms = fit_pitch(dsm, main, px, ze)
+        fit_rise, fit_tan, fit_rms = fit_pitch(dsm, main, px, ze, known)
         if rise is None:
             rise = fit_rise
         if force_flat or rise <= LOW_SLOPE_RISE:
@@ -1030,7 +1044,7 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
         tan = rise / 12.0
         nn = len(outline)
         elen = {e: math.hypot(*(outline[(e + 1) % nn] - outline[e])) * px for e in range(nn)}
-        spans = gable_edges(outline, dsm, main, ze, px, tan)
+        spans = gable_edges(outline, dsm, main & known, ze, px, tan)
         if have_planes:
             # the fitted planes are a second, independent gable detector: a
             # plane that slopes along an outline edge is a rake. Edges it
@@ -1054,8 +1068,8 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
                 if not g_try.ok or not g_try.totals.get("eaves_ft"):
                     continue
                 model_try = rasterize_model(g_try, main, px_x, px_y, ze, tan)
-                sel = main & np.isfinite(model_try) & (d_orig > 0.4)
-                if sel.sum() < 0.6 * main.sum():
+                sel = main & known & np.isfinite(model_try) & (d_orig > 0.4)
+                if sel.sum() < 0.6 * (main & known).sum():
                     continue
                 r = (dsm - model_try)[sel]
                 p90 = float(np.percentile(np.abs(r), 90)); rms = float(np.sqrt(np.mean(r * r)))
@@ -1078,10 +1092,10 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
         g.info["gables_chosen"] = {int(e): spans[e] for e in gab}
         resid = dsm - model
         d = _edt(main, px)
-        low = main & (d > 0.3) & np.isfinite(resid) & (resid < -LOWER_SECTION_DROP_M)
+        low = main & known & (d > 0.3) & np.isfinite(resid) & (resid < -LOWER_SECTION_DROP_M)
         lab, comps = _components(low)
         found = False
-        grow_ok = main & np.isfinite(resid) & (resid < -0.3)
+        grow_ok = main & known & np.isfinite(resid) & (resid < -0.3)
         for cid, cnt in comps:
             if cnt * px * px >= LOWER_SECTION_MIN_M2 and depth < MAX_PEEL_DEPTH:
                 reg = lab == cid
@@ -1100,7 +1114,7 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
         if not found or force_flat:
             break
         main = _largest_component(main)
-    sel = main & np.isfinite(model) & (_edt(main, px) > 0.4)
+    sel = main & known & np.isfinite(model) & (_edt(main, px) > 0.4)
     r = (dsm - model)[sel] if sel.any() else np.array([0.0])
     g.info.update({"eave_z": round(ze, 2), "fit_rms_m": round(float(np.sqrt(np.mean(r * r))), 2),
                    "p90_m": round(float(np.percentile(np.abs(r), 90)), 2),
@@ -1111,7 +1125,7 @@ def generate_roof(dsm: np.ndarray, roof: np.ndarray, px_x: float, px_y: float,
         if depth + 1 >= MAX_LEVELS:
             break
         sub = generate_roof(dsm, reg, px_x, px_y, axis_hint=axis_hint, depth=depth + 1,
-                            labels=labels, planes=planes, force_flat=is_flat, ground=ground)
+                            labels=labels, planes=planes, force_flat=is_flat, ground=ground, known=known)
         if not sub.ok:
             continue
         _merge_sub(g, sub, main, px, next_fid)
@@ -1163,7 +1177,8 @@ def _merge_sub(g: RoofGraph, sub: RoofGraph, main_mask: np.ndarray, px: float, b
 
 # ------------------------------------------------------------ plan support test
 
-def plan_support(plan_edges, plane_edges, px: float, tol_m: float = 1.0) -> dict:
+def plan_support(plan_edges, plane_edges, px: float, tol_m: float = 1.0,
+                 known: np.ndarray | None = None) -> dict:
     """How well the measured plane intersections support a framed plan.
 
     Both inputs are edge lists with .kind, .p0, .p1 in raster px. Only
@@ -1199,8 +1214,85 @@ def plan_support(plan_edges, plane_edges, px: float, tol_m: float = 1.0) -> dict
         return d * px
 
     pa = samples(A); pb = samples(B)
+    if known is not None:
+        # lines under tree canopy have no measured plane to support them:
+        # they are neither for nor against the plan
+        h, w = known.shape
+        def keep(pts):
+            yy = np.clip(np.round(pts[:, 0]).astype(int), 0, h - 1)
+            xx = np.clip(np.round(pts[:, 1]).astype(int), 0, w - 1)
+            return known[yy, xx]
+        ka = keep(pa)
+        if ka.sum() >= 10:
+            pa = pa[ka]
+        kb = keep(pb)
+        if kb.sum() >= 10:
+            pb = pb[kb]
     sup = float((seg_dist(pa, B) <= tol_m).mean())
     cov = float((seg_dist(pb, A) <= tol_m).mean())
-    la = sum(float(np.hypot(*(b - a))) for a, b in A) * px
-    lb = sum(float(np.hypot(*(b - a))) for a, b in B) * px
+    la = len(pa) * 0.5
+    lb = len(pb) * 0.5
     return {"support": round(sup, 3), "coverage": round(cov, 3), "plan_len_m": round(la, 1), "plane_len_m": round(lb, 1)}
+
+
+def rectilinearize(outline_px: np.ndarray, axis_deg: float | None, max_len_m: float = 6.0,
+                   px: float = 0.1) -> np.ndarray:
+    """A house outline has edges on two axes only. Any edge more than 12
+    degrees off both axes (a tree line, a raster artefact) is replaced by
+    the two axis-aligned edges through the corner that lies OUTSIDE the
+    polygon, so the completion errs long, never short. Edges longer than
+    max_len_m are left alone (a long diagonal is a real bay or a wrong
+    axis, not an artefact)."""
+    from shapely.geometry import Polygon, Point
+
+    P = np.asarray(outline_px, float)
+    n = len(P)
+    if n < 4 or axis_deg is None:
+        return P
+    th = math.radians(axis_deg)
+    ca, sa = math.cos(th), math.sin(th)
+    ctr = P.mean(axis=0)
+
+    def to_uv(p):
+        y, x = p[0] - ctr[0], p[1] - ctr[1]
+        return np.array([x * ca + y * sa, -x * sa + y * ca])
+
+    def to_yx(q):
+        u, v = q
+        return np.array([ctr[0] + (u * sa + v * ca), ctr[1] + (u * ca - v * sa)])
+
+    Q = [to_uv(p) for p in P]
+    poly = Polygon([(q[0], q[1]) for q in Q])
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    out = []
+    changed = False
+    for i in range(n):
+        a, b = Q[i], Q[(i + 1) % n]
+        d = b - a; L = float(np.hypot(*d))
+        out.append(a)
+        if L < 1e-6:
+            continue
+        off = math.degrees(math.atan2(abs(d[1]), abs(d[0])))
+        off = min(off, 90.0 - off)
+        if off <= 12.0 or L * px > max_len_m:
+            continue
+        c1 = np.array([b[0], a[1]]); c2 = np.array([a[0], b[1]])
+        # the corner outside the polygon (or the one that adds area)
+        c = c1 if not poly.contains(Point(c1[0], c1[1])) else c2
+        if poly.contains(Point(c[0], c[1])):
+            continue
+        out.append(c)
+        changed = True
+    if not changed:
+        return P
+    R = np.array([to_yx(q) for q in out])
+    # drop duplicates
+    keep = [R[0]]
+    for q in R[1:]:
+        if np.hypot(*(q - keep[-1])) > 0.5:
+            keep.append(q)
+    if len(keep) > 1 and np.hypot(*(keep[0] - keep[-1])) <= 0.5:
+        keep.pop()
+    R = np.array(keep)
+    return R if _valid_ring(R) else P

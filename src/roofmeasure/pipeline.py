@@ -349,6 +349,7 @@ def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
     from . import wireframe as wfm
     from .model import Facet
     from .vectorize import trace_boundary
+    from .roofgraph import rectilinearize as rgm_rect
 
     try:
         chain = trace_boundary(detail.labels > 0)
@@ -360,10 +361,18 @@ def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
         restored = 0
         dsm = getattr(detail, "dsm", None)
         ground = getattr(detail, "ground", None)
+        canopy_runs = 0; canopy_added_m2 = 0.0
+        labels_seen = detail.labels > 0            # planes the segmentation really found
         if dsm is not None and ground is not None:
             outline, restored = wfm.complete_occluded_corners(outline, dsm, ground, px_m)
-            if restored:
+            # tree-line runs: the eave line is completed from the house geometry
+            outline, canopy_runs, canopy_added_m2 = wfm.complete_canopy_runs(outline, dsm, ground, px_m, axis_deg=axis)
+            outline = rgm_rect(outline, axis, px=px_m)
+            if restored or canopy_runs:
                 detail.labels = wfm.extend_labels_to_outline(detail.labels, outline)
+        # elevation that is roof, not canopy: where the plane segmentation
+        # found a plane before any completion (no plane exists under a tree)
+        known = labels_seen.copy()
         wf = wfm.build_wireframe(detail.labels, detail.planes, outline, detail.px_x, detail.px_y)
         plane_wf = wf                          # the measured-plane wireframe, kept for the ordering check
         # ---- framing model first: the graph derived from the eave line the way
@@ -377,7 +386,7 @@ def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
                 foot = foot | detail.roof_mask        # the footprint, including facets segmentation dropped
             g = rgm.generate_roof(detail.dsm.astype(float), foot, detail.px_x, detail.px_y,
                                   axis_hint=axis, labels=detail.labels, planes=detail.planes,
-                                  ground=getattr(detail, "ground", None))
+                                  ground=getattr(detail, "ground", None), known=known)
             fit = g.info if g.ok else {}
             p90 = fit.get("p90_m", 9.9); rms = fit.get("fit_rms_m", 9.9); bias = abs(fit.get("bias_m", 9.9))
             mask_px = float((detail.labels > 0).sum())
@@ -388,11 +397,12 @@ def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
             # covers the footprint. The elevation agreement is reported as the
             # confidence of the plan, never as a reason to draw the measured
             # plane intersections instead.
-            support = rgm.plan_support(g.edges, wf.edges, px_m) if g.ok else {"support": 0.0, "coverage": 0.0,
-                                                                             "plan_len_m": 0.0, "plane_len_m": 0.0}
+            support = rgm.plan_support(g.edges, wf.edges, px_m, known=known) if g.ok else {
+                "support": 0.0, "coverage": 0.0, "plan_len_m": 0.0, "plane_len_m": 0.0}
             len_ratio = support["plan_len_m"] / max(support["plane_len_m"], 1.0)
-            supported = (support["support"] >= FRAMING_MIN_SUPPORT and len_ratio <= FRAMING_MAX_LEN_RATIO) \
-                or (p90 <= FRAMING_FIT_P90_M and rms <= FRAMING_FIT_RMS_M and bias <= FRAMING_FIT_BIAS_M)
+            # the measured planes decide; height residuals alone are not a judge
+            # (at 3/12 a wrong hip plan fits the heights within inches)
+            supported = support["support"] >= FRAMING_MIN_SUPPORT and len_ratio <= FRAMING_MAX_LEN_RATIO
             if g.ok and 0.80 <= area_ratio <= 1.20 and g.totals.get("eaves_ft") and supported:
                 g.outline = outline
                 g.polys_ready = True
@@ -512,6 +522,13 @@ def _attach_skeleton(m: RoofMeasurements, detail, px_m: float) -> None:
         if restored:
             m.notes.append(f"{restored} roof corner(s) hidden by tree canopy were squared off from the "
                            "adjacent roof edges; verify those corners in the field.")
+        if canopy_runs:
+            m.notes.append(
+                f"Tree line completed: {canopy_runs} stretch(es) of the footprint followed the canopy "
+                f"rather than the house; the eave line there was drawn straight from the nearest trusted "
+                f"corners on the building axes (about {canopy_added_m2 * 10.7639:.0f} sq ft of plan area "
+                "recovered). The elevation under the canopy was not used for pitch or lines. Field verify "
+                "those eaves.")
         if framing_note:
             m.notes.append(framing_note)
         else:
