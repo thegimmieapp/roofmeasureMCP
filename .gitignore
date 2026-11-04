@@ -13,3 +13,4 @@ Google_Maps_API_Key*
 CONNECTOR_URL.txt
 Deploy RoofMeasure.command
 .commit-message.txt
+.lotcache/

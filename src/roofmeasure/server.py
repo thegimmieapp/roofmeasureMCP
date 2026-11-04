@@ -4,6 +4,11 @@ Tools:
   measure_roof              - satellite roof measurements for an address
   generate_roof_report      - EagleView-style Markdown report file
   generate_xactimate_estimate - Xactimate-style .docx insurance estimate
+  measure_lot               - LotMeasure: parcel, yard zones, surfaces, setbacks, sun, trees
+  generate_lot_plan         - LotMeasure plan drawing (PNG + PDF)
+
+HTTP mode also serves a JSON API for websites (X-API-Key header):
+  GET /<secret>/api/lot?address=...   GET /<secret>/api/roof?address=...   GET /<secret>/api/health
 
 Run:  roofmeasure-mcp          (stdio transport)
 """
@@ -29,7 +34,10 @@ mcp = FastMCP(
         "provided them, ASK THE USER for: (1) property address, (2) homeowner "
         "name and phone, (3) date of loss, and optionally claim number, policy "
         "number, and component counts (pipe jacks, vents, skylights, chimneys). "
-        "Only the address is required for measure_roof and generate_roof_report."
+        "Only the address is required for measure_roof and generate_roof_report. "
+        "LOT TOOLS: measure_lot and generate_lot_plan need only the address. Quote "
+        "their confidence notes; never state a lot size when lot_source is 'none'; "
+        "lot lines come from county GIS and are not a survey."
     ),
 )
 
@@ -280,6 +288,131 @@ def generate_xactimate_estimate(
     return json.dumps(totals, indent=2)
 
 
+# ---------------------------------------------------------------- LotMeasure
+
+CACHE_TTL_S = 24 * 3600
+
+import threading as _threading  # noqa: E402
+
+# A 100 m lot tile peaks near 0.9 GB; the Fly machine has 2 GB, so lot runs
+# are serialized (a second request waits instead of running the box out of memory).
+_LOT_LOCK = _threading.Lock()
+
+
+def _cache_path(kind: str, address: str, variant: str = "") -> str:
+    import hashlib
+
+    norm = re.sub(r"\s+", " ", address.strip().lower())
+    h = hashlib.sha256(f"{kind}|{norm}|{variant}".encode()).hexdigest()[:24]
+    d = os.path.join(_out_dir(), "api_cache")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{kind}_{h}.json")
+
+
+def _cache_get(kind: str, address: str, variant: str = ""):
+    import time
+
+    p = _cache_path(kind, address, variant)
+    try:
+        if time.time() - os.path.getmtime(p) < CACHE_TTL_S:
+            with open(p) as f:
+                d = json.load(f)
+            d["cached"] = True
+            return d
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _cache_put(kind: str, address: str, data: dict, variant: str = "") -> None:
+    try:
+        with open(_cache_path(kind, address, variant), "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def _lot_with_plan(address: str, include_sun: bool = True, brand: str = "Stronghouse Solutions",
+                   prepared_for: str = "", make_plan: bool = True) -> dict:
+    from . import lot
+
+    with _LOT_LOCK:
+        res = lot.measure_lot(address, include_sun=include_sun, keep_rasters=make_plan)
+        return _finish_lot(res, address, brand, prepared_for, make_plan)
+
+
+def _finish_lot(res, address, brand, prepared_for, make_plan):
+    if make_plan and "_plan" in res:
+        from .lotplan import render_lot_plan
+
+        slug = _slug(address)
+        btag = re.sub(r"[^A-Za-z0-9]+", "", brand)[:20] or "plan"
+        png = os.path.join(_out_dir(), f"Lot_Plan_{slug}_{btag}.png")
+        pdf = os.path.join(_out_dir(), f"Lot_Plan_{slug}_{btag}.pdf")
+        try:
+            render_lot_plan(res, png, pdf_path=pdf, brand=brand, prepared_for=prepared_for)
+            res["plan_png"] = png
+            res["plan_pdf"] = pdf
+            res["plan_png_url"] = _public_url(png)
+            res["plan_pdf_url"] = _public_url(pdf)
+        except Exception as exc:  # the numbers stand even if the drawing fails
+            res["confidence"]["notes"].append(f"Plan drawing unavailable ({type(exc).__name__}: {exc}).")
+    res.pop("_plan", None)
+    return res
+
+
+@mcp.tool()
+def measure_lot(address: str, include_sun: bool = True) -> str:
+    """Measure a property lot for landscape design from a street address.
+
+    Returns JSON: parcel (lot line ring in lat/lng, area sq ft and acres,
+    source, county-recorded area and the difference), house footprint (plan
+    sq ft and outline, from RoofMeasure), yard zones front/back/left/right
+    (area, surface breakdown: lawn_planting, hardscape, tree_canopy,
+    pool_water, bare_soil_or_mulch, detached_structure, unknown; setback from
+    the house wall to the lot line; largest clear plantable rectangle; sun
+    classes full/part/shade from June hours of direct sun), trees (location,
+    canopy diameter, height, within 3 m of the house), totals (plantable and
+    hardscape), confidence notes, imagery date.
+
+    lot_source is "county_arcgis", "regrid" or "none". When it is "none" there
+    is NO lot size: never state one; the yard figures then cover a 15 m band
+    around the house. Lot lines come from county GIS, not a survey.
+
+    Args:
+        address: Full property address (street, city, state, zip).
+        include_sun: Include sun exposure from the Solar API hourly shade layers.
+    """
+    hit = _cache_get("lot", address, f"sun={int(include_sun)}")
+    if hit:
+        return json.dumps(hit, indent=1)
+    res = _lot_with_plan(address, include_sun=include_sun, make_plan=False)
+    _cache_put("lot", address, res, f"sun={int(include_sun)}")
+    return json.dumps(res, indent=1)
+
+
+@mcp.tool()
+def generate_lot_plan(address: str, brand: str = "Stronghouse Solutions", prepared_for: str = "",
+                      include_sun: bool = True) -> str:
+    """Draw the lot plan (PNG + PDF): parcel outline, rectilinear house,
+    yard surfaces shaded by class, sun hatching on plantable ground, trees,
+    setback dimensions, largest clear rectangles, north arrow, scale bar,
+    zone table and confidence notes. Returns JSON with plan_png_url /
+    plan_pdf_url download links and the full measure_lot result.
+
+    Args:
+        address: Full property address.
+        brand: "Stronghouse Solutions" (logo) or "Dream Landscaper" (neutral
+            DL header), or any company name for a plain header.
+        prepared_for: Optional homeowner / client name for the header.
+        include_sun: Include sun exposure hatching and sun classes.
+    """
+    res = _lot_with_plan(address, include_sun=include_sun, brand=brand, prepared_for=prepared_for)
+    out = {k: res.get(k, "") for k in ("plan_png", "plan_png_url", "plan_pdf", "plan_pdf_url")}
+    out["lot"] = res
+    return json.dumps(out, indent=1)
+
+
 def _measurements_from_json(s: str, address: str):
     from .model import EdgeSummary, Facet, RoofMeasurements
 
@@ -322,6 +455,8 @@ def main_http():
                                /<secret>/mcp and files are /<secret>/files/<name>
       ROOFMEASURE_PUBLIC_URL   https://your-app.example.com (for download links)
       ROOFMEASURE_OUT_DIR      where reports are written (default /data/reports)
+      LOTMEASURE_API_KEY       key the website sends as X-API-Key for /<secret>/api/*
+      REGRID_API_KEY           optional: Regrid parcel API fallback for counties without a free layer
     """
     from starlette.requests import Request
     from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
@@ -370,6 +505,77 @@ def main_http():
     @mcp.custom_route("/health", methods=["GET"])
     async def _health(_request: Request):
         return JSONResponse({"ok": True, "service": "roofmeasure-mcp"})
+
+    # ---- JSON API for websites (Dream Landscaper): X-API-Key: <LOTMEASURE_API_KEY>
+    import hmac
+
+    import anyio
+
+    from . import __version__
+
+    def _authorized(request: Request) -> bool:
+        want = os.environ.get("LOTMEASURE_API_KEY", "").strip()
+        got = request.headers.get("x-api-key", "").strip()
+        return bool(want) and hmac.compare_digest(want.encode(), got.encode())
+
+    def _deny():
+        return JSONResponse({"ok": False, "error": "missing or invalid X-API-Key"}, status_code=401)
+
+    def _flag(request: Request, name: str, default: bool) -> bool:
+        v = request.query_params.get(name)
+        return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+
+    @mcp.custom_route(f"{prefix}/api/health", methods=["GET"])
+    async def _api_health(request: Request):
+        return JSONResponse({"ok": True, "service": "roofmeasure-mcp", "version": __version__,
+                             "authorized": _authorized(request),
+                             "api_key_configured": bool(os.environ.get("LOTMEASURE_API_KEY", "").strip())})
+
+    @mcp.custom_route(f"{prefix}/api/lot", methods=["GET"])
+    async def _api_lot(request: Request):
+        if not _authorized(request):
+            return _deny()
+        address = (request.query_params.get("address") or "").strip()
+        if len(address) < 6:
+            return JSONResponse({"ok": False, "error": "address query parameter is required"}, status_code=400)
+        sun = _flag(request, "sun", True)
+        plan = _flag(request, "plan", True)
+        brand = request.query_params.get("brand") or "Dream Landscaper"
+        variant = f"sun={int(sun)}|plan={int(plan)}|brand={brand}"
+        if not _flag(request, "refresh", False):
+            hit = _cache_get("lot", address, variant)
+            if hit:
+                return JSONResponse({"ok": True, **hit})
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: _lot_with_plan(address, include_sun=sun, brand=brand, make_plan=plan))
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status_code=502)
+        for k in ("plan_png", "plan_pdf"):
+            res.pop(k, None)               # server paths stay private; the *_url fields are the links
+        res["cached"] = False
+        _cache_put("lot", address, res, variant)
+        return JSONResponse({"ok": True, **res})
+
+    @mcp.custom_route(f"{prefix}/api/roof", methods=["GET"])
+    async def _api_roof(request: Request):
+        if not _authorized(request):
+            return _deny()
+        address = (request.query_params.get("address") or "").strip()
+        if len(address) < 6:
+            return JSONResponse({"ok": False, "error": "address query parameter is required"}, status_code=400)
+        if not _flag(request, "refresh", False):
+            hit = _cache_get("roof", address)
+            if hit:
+                return JSONResponse({"ok": True, **hit})
+        try:
+            raw = await anyio.to_thread.run_sync(lambda: measure_roof(address))
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status_code=502)
+        res = json.loads(raw)
+        res["cached"] = False
+        _cache_put("roof", address, res)
+        return JSONResponse({"ok": True, **res})
 
     mcp.run(transport="streamable-http")
 

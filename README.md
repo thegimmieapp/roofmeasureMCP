@@ -235,6 +235,49 @@ Entry point: `roofmeasure-mcp-http` (Streamable HTTP, stateless, JSON
 responses). Environment: `PORT`, `GOOGLE_MAPS_API_KEY`,
 `ROOFMEASURE_PATH_SECRET`, `ROOFMEASURE_PUBLIC_URL`, `ROOFMEASURE_OUT_DIR`.
 
+## LotMeasure: the lot for landscape design (v0.6.0)
+
+Two more MCP tools on the same server, plus a JSON API for websites.
+
+- `measure_lot(address, include_sun=True)`: lot line (county GIS parcel
+  polygon) with area in sq ft and acres and the county's recorded size; the
+  house footprint from RoofMeasure; front / back / left / right yard zones
+  (left and right as seen from the street), each with area, surface
+  breakdown (lawn and planting, hardscape, tree canopy, pool, bare soil or
+  mulch, detached structure, unknown), the setback from the house wall to the
+  lot line, the largest clear plantable rectangle and sun classes; trees with
+  location, crown diameter, height and whether they are within 3 m of the
+  house; totals; confidence notes.
+- `generate_lot_plan(address, brand="Stronghouse Solutions", prepared_for="")`:
+  plan PNG + PDF (`plan_png_url`, `plan_pdf_url`). `brand="Dream Landscaper"`
+  gives the neutral DL header.
+
+Data sources, in order: county / state ArcGIS parcel layers (seeded and
+verified in `src/roofmeasure/parcels_registry.json` for Greene MO, Christian
+MO (City of Nixa area), Travis TX, Williamson TX, Santa Rosa and Escambia FL,
+plus the Florida statewide layer; other counties are discovered on ArcGIS
+Online and cached as unverified); Regrid when `REGRID_API_KEY` is set;
+otherwise `lot_source: "none"` and no lot size is reported. Street frontage:
+OpenStreetMap road centreline when Overpass answers, else the lot line with
+no neighbouring parcel across it (driveway breaks ties), else the line the
+driveway reaches. Sun: Solar API hourly shade (June and December) and annual
+flux; plantable ground is full sun at 6 h or more of June sun, part sun 3 to
+6 h, shade under 3 h. Solar rasters are UTM (EPSG:326xx); `geo.TileGeo` maps
+lat/lng to pixels and back without pyproj.
+
+JSON API (HTTP mode), header `X-API-Key: <LOTMEASURE_API_KEY>`:
+
+    GET /<secret>/api/lot?address=...&sun=1&plan=1&brand=Dream%20Landscaper&refresh=0
+    GET /<secret>/api/roof?address=...
+    GET /<secret>/api/health
+
+Results are cached by address for 24 h on the volume. Set the key with
+`fly secrets set LOTMEASURE_API_KEY=$(openssl rand -hex 24)`.
+
+Calibration: `GOOGLE_MAPS_API_KEY=... python tests/fetch_lot_cache.py <dir>`
+caches raw GeoTIFFs; `python tests/calibrate_lot.py <dir> [plan_dir]`
+compares lot areas with the county record and draws plans.
+
 ## Use from the command line
 
 ```bash

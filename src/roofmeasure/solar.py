@@ -139,3 +139,85 @@ def fetch_geotiff_rgb(url: str) -> np.ndarray | None:
         return arr[..., :3].astype(np.uint8)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------- v0.6.0: georeferenced layers (LotMeasure)
+
+
+def geocode_full(address: str) -> dict:
+    """Geocode with the parts LotMeasure needs: lat, lng, formatted address,
+    county, state, route (street name) and location_type (ROOFTOP etc.)."""
+    r = requests.get(GEOCODE_URL, params={"address": address, "key": _key()}, timeout=30)
+    data = r.json()
+    if data.get("status") != "OK" or not data.get("results"):
+        raise SolarAPIError(f"Could not geocode address '{address}': {data.get('status')} {data.get('error_message', '')}")
+    return parse_geocode_result(data["results"][0], address)
+
+
+def parse_geocode_result(res: dict, address: str = "") -> dict:
+    comps = {c["types"][0]: c for c in res.get("address_components", []) if c.get("types")}
+    loc = res["geometry"]["location"]
+
+    def name(t, short=False):
+        c = comps.get(t)
+        return (c["short_name"] if short else c["long_name"]) if c else ""
+
+    return {
+        "lat": loc["lat"], "lng": loc["lng"],
+        "formatted": res.get("formatted_address", address),
+        "county": name("administrative_area_level_2"),
+        "state": name("administrative_area_level_1", short=True),
+        "route": name("route"),
+        "locality": name("locality"),
+        "location_type": res["geometry"].get("location_type", ""),
+    }
+
+
+def _download(url: str) -> bytes:
+    r = requests.get(url, params={"key": _key()}, timeout=180)
+    r.raise_for_status()
+    return r.content
+
+
+def read_geotiff_geo(content: bytes, bands: bool = False):
+    """Parse GeoTIFF bytes -> (array, px_x_m, px_y_m, TileGeo).
+
+    Unlike fetch_geotiff this keeps the tile origin, so a lat/lng polygon can
+    be mapped into pixels and back (geo.TileGeo). With bands=True a
+    multi-band raster (hourly shade: 24 bands) is returned as H x W x B in its
+    native dtype; otherwise band 0 as float32 (RGB: H x W x 3 uint8 via
+    read_geotiff_rgb_geo)."""
+    import logging
+    import tifffile
+
+    from .geo import geo_from_tiff_tags
+
+    logging.getLogger("tifffile").setLevel(logging.ERROR)
+    with tifffile.TiffFile(io.BytesIO(content)) as tf:
+        page = tf.pages[0]
+        arr = page.asarray()
+        geo = geo_from_tiff_tags(page.tags, page.shape)
+    if arr.ndim == 3 and arr.shape[0] < arr.shape[-1] and arr.shape[0] <= 32 and arr.shape[1] == geo.shape[1]:
+        arr = np.moveaxis(arr, 0, -1)            # band-first -> band-last
+    h, w = arr.shape[:2]
+    geo.shape = (h, w)
+    lat_c, _ = geo.px_to_latlng(h / 2.0, w / 2.0)
+    px_x, px_y = geo.px_size_m(float(lat_c))
+    if bands:
+        return arr, px_x, px_y, geo
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return arr.astype(np.float32), px_x, px_y, geo
+
+
+def read_geotiff_rgb_geo(content: bytes):
+    arr, px_x, px_y, geo = read_geotiff_geo(content, bands=True)
+    if arr.ndim != 3:
+        return None, geo
+    return arr[..., :3].astype(np.uint8), geo
+
+
+def fetch_geotiff_geo(url: str, bands: bool = False):
+    """Download a Solar API GeoTIFF keeping its georeference:
+    (array, px_x_m, px_y_m, TileGeo)."""
+    return read_geotiff_geo(_download(url), bands=bands)

@@ -17,6 +17,8 @@ ADDRESSES = {
     "lynda": "2022 North Benton Avenue, Springfield, MO 65803",
     "fred": "4834 East Kingwood Court, Springfield, MO 65809",
     "jenny": "3287 West Farm Road 94, Springfield, MO 65803",
+    "garland": "1747 E Garland Ct, Republic, MO 65738",
+    "maplewood": "3669 W Maplewood St, Springfield, MO 65807",
 }
 
 out = sys.argv[1]

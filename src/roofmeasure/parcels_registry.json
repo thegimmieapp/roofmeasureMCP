@@ -1,0 +1,75 @@
+{
+  "_about": "County parcel layers for LotMeasure, keyed STATE|County Name (Google geocode administrative_area_level_2). Each layer was verified on 2026-11-03 by geocoding a residential situs address from the layer and point-querying it back (polygon returned, address matched). area_fields: county-recorded lot size attributes, first non-empty wins; units acres or sqft. Owner and mailing fields are never returned by LotMeasure.",
+  "MO|Greene County": [
+    {
+      "url": "https://maps.springfieldmo.gov/arcgis/rest/services/Maps/GisViewer/MapServer/66",
+      "name": "City of Springfield / Greene County GIS parcels (GisViewer layer 66)",
+      "area_fields": [["ACRES", "acres"], ["SF", "sqft"]],
+      "gis_area_fields": [["Shape.STArea()", "sqft"]],
+      "id_field": "PIN",
+      "verified": "2026-11-03: 1747 E Garland Ct, Republic MO (PIN 881721200420, ACRES 0.2155)",
+      "coverage": "all of Greene County"
+    }
+  ],
+  "MO|Christian County": [
+    {
+      "url": "https://gis.tothassociates.com/arcgis/rest/services/Nixa/Parcels/FeatureServer/0",
+      "name": "City of Nixa parcels (Christian County assessor attributes, hosted by Toth & Associates)",
+      "area_fields": [["acres", "acres"]],
+      "id_field": "PARCEL_NO",
+      "verified": "2026-11-03: 814 S Cobble Creek Blvd and 3806 Kimber Rd, Nixa MO",
+      "coverage": "Nixa and its planning area only; Ozark and rural Christian County are not covered (the county's own server gis.christiancountymo.gov fails TLS verification)"
+    }
+  ],
+  "TX|Travis County": [
+    {
+      "url": "https://taxmaps.traviscountytx.gov/arcgis/rest/services/Parcels/FeatureServer/0",
+      "name": "Travis County TNR / TCAD parcels",
+      "area_fields": [["tcad_acres", "acres"], ["legal_acre", "acres"]],
+      "gis_area_fields": [["GIS_acres", "acres"]],
+      "id_field": "PROP_ID",
+      "verified": "2026-11-03: 3208 Merrie Lynn Ave, Austin TX (tcad_acres 0.1818)",
+      "coverage": "all of Travis County"
+    }
+  ],
+  "TX|Williamson County": [
+    {
+      "url": "https://services1.arcgis.com/Xff0bbfp6vwIWmlU/arcgis/rest/services/WCAD_Tax_Parcels/FeatureServer/0",
+      "name": "Williamson Central Appraisal District tax parcels",
+      "area_fields": [["STATEDAREA", "acres"], ["TotAcreDeed", "acres"]],
+      "id_field": "PARCELID",
+      "verified": "2026-11-03: 3315 Winding Way, Round Rock TX (STATEDAREA 0.162)",
+      "coverage": "all of Williamson County"
+    }
+  ],
+  "FL|Santa Rosa County": [
+    {
+      "url": "https://services9.arcgis.com/Gh9awoU677aKree0/arcgis/rest/services/Florida_Statewide_Cadastral/FeatureServer/0",
+      "name": "Florida statewide cadastral (Department of Revenue / county property appraisers), Santa Rosa CO_NO 67",
+      "area_fields": [["LND_SQFOOT", "sqft"]],
+      "id_field": "PARCEL_ID",
+      "verified": "2026-11-03: 5179 Lake End Dr, Milton FL; 8543 Navarre Pkwy, Navarre FL",
+      "coverage": "all Florida counties (statewide layer)"
+    }
+  ],
+  "FL|Escambia County": [
+    {
+      "url": "https://services9.arcgis.com/Gh9awoU677aKree0/arcgis/rest/services/Florida_Statewide_Cadastral/FeatureServer/0",
+      "name": "Florida statewide cadastral (Department of Revenue / county property appraisers), Escambia CO_NO 27",
+      "area_fields": [["LND_SQFOOT", "sqft"]],
+      "id_field": "PARCEL_ID",
+      "verified": "2026-11-03: 9880 Bridlewood Rd, Pensacola FL; 221 Palafox Pl, Pensacola FL",
+      "coverage": "all Florida counties (statewide layer)"
+    }
+  ],
+  "FL|*": [
+    {
+      "url": "https://services9.arcgis.com/Gh9awoU677aKree0/arcgis/rest/services/Florida_Statewide_Cadastral/FeatureServer/0",
+      "name": "Florida statewide cadastral (Department of Revenue / county property appraisers)",
+      "area_fields": [["LND_SQFOOT", "sqft"]],
+      "id_field": "PARCEL_ID",
+      "verified": "2026-11-03 (Santa Rosa and Escambia addresses)",
+      "coverage": "statewide fallback for any Florida county"
+    }
+  ]
+}
