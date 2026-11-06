@@ -330,3 +330,29 @@ addresses once (needs `GOOGLE_MAPS_API_KEY`); `tests/calibrate.py` then runs
 the engine offline and prints every measurement next to the EagleView value.
 Add a report's numbers to `TRUTH` in `calibrate.py` to extend the set.
 Synthetic roofs with analytic truth live in `tests/synth.py` (`pytest`).
+
+### Landscape scoping map contract
+
+Website integrations can opt into `GET /<secret>/api/lot?address=...&map=1&plan=0`
+with the existing `X-API-Key` authentication. `map=1` adds `scope_map` (version 1),
+plus `aerial_png_url` when aerial imagery is available. The default API/MCP
+measurement responses remain unchanged.
+
+Map coordinates are **feet east and south from the cropped raster's top-left
+edge**, with `width_ft` and `height_ft`. `parcel`, `region` and `house` are arrays
+of polygons; each polygon is an array of rings (outer ring, then holes); each
+ring contains `[x, y]` points. Zones include polygons and the largest clear
+rectangle; trees include centres and canopy radii in the same coordinate space.
+The PNG is exported without plot margins, so an image stretched to those map
+bounds aligns with every vector. Grid north is approximately true north.
+
+A missing parcel produces an empty `parcel`, never a fabricated lot boundary.
+A withheld/uncertain house produces an empty `house`. `region` describes only
+the covered portion usable for scoping. Integrators must retain coverage,
+confidence and imagery notes, use the measurements only for approximate concept
+plans, and require on-site verification. The map is existing conditions, not
+an automatically approved landscape design or survey.
+
+Copy the aerial to private application storage server-side. The connector's
+private path appears in generated asset URLs and must never be forwarded to a
+homeowner, lead record, client log or public page.

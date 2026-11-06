@@ -333,11 +333,20 @@ def _cache_put(kind: str, address: str, data: dict, variant: str = "") -> None:
 
 
 def _lot_with_plan(address: str, include_sun: bool = True, brand: str = "Stronghouse Solutions",
-                   prepared_for: str = "", make_plan: bool = True) -> dict:
+                   prepared_for: str = "", make_plan: bool = True, make_map: bool = False) -> dict:
     from . import lot
 
     with _LOT_LOCK:
-        res = lot.measure_lot(address, include_sun=include_sun, keep_rasters=make_plan)
+        res = lot.measure_lot(address, include_sun=include_sun, keep_rasters=make_plan or make_map)
+        if make_map and "_plan" in res:
+            from .scopemap import scope_map, save_aerial
+            res["scope_map"] = scope_map(res)
+            # Hash avoids address-bearing filenames in the landscape integration.
+            import hashlib
+            digest = hashlib.sha256(address.strip().lower().encode()).hexdigest()[:24]
+            aerial = os.path.join(_out_dir(), f"Scope_Aerial_{digest}.png")
+            if save_aerial(res, aerial):
+                res["aerial_png_url"] = _public_url(aerial)
         return _finish_lot(res, address, brand, prepared_for, make_plan)
 
 
@@ -540,15 +549,18 @@ def main_http():
             return JSONResponse({"ok": False, "error": "address query parameter is required"}, status_code=400)
         sun = _flag(request, "sun", True)
         plan = _flag(request, "plan", True)
+        make_map = _flag(request, "map", False)
         brand = request.query_params.get("brand") or "Dream Landscaper"
         variant = f"sun={int(sun)}|plan={int(plan)}|brand={brand}"
+        if make_map:
+            variant += "|map=1"
         if not _flag(request, "refresh", False):
             hit = _cache_get("lot", address, variant)
             if hit:
                 return JSONResponse({"ok": True, **hit})
         try:
             res = await anyio.to_thread.run_sync(
-                lambda: _lot_with_plan(address, include_sun=sun, brand=brand, make_plan=plan))
+                lambda: _lot_with_plan(address, include_sun=sun, brand=brand, make_plan=plan, make_map=make_map))
         except Exception as exc:
             return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status_code=502)
         for k in ("plan_png", "plan_pdf"):
