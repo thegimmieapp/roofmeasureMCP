@@ -19,6 +19,7 @@ dependencies = [
     "tifffile>=2023.7.10",
     "python-docx>=1.1.0",
     "matplotlib>=3.7",
+    "Pillow>=10",
     "contourpy>=1.0",
     "scipy>=1.10",
     "shapely>=2.0",
